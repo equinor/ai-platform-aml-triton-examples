@@ -1,0 +1,30 @@
+name: "pytorch_sine"
+backend: "onnxruntime"
+max_batch_size: 64
+
+input [
+  {
+    name: "x"
+    data_type: TYPE_FP32
+    dims: [1]
+  }
+]
+
+output [
+  {
+    name: "y"
+    data_type: TYPE_FP32
+    dims: [1]
+  }
+]
+
+instance_group [
+  {
+    kind: KIND_CPU
+    count: 1
+  }
+]
+
+dynamic_batching {
+  max_queue_delay_microseconds: 100
+}

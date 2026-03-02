@@ -19,11 +19,11 @@ triton-env/
 # Jupyter
 .ipynb_checkpoints/
 *.ipynb_checkpoints
-# Output notebooks contain execution results (including sensitive API keys in curl examples)
-*-output.ipynb
+# Output notebooks — sensitive values (API keys, subscription IDs) scrubbed before commit
+# *-output.ipynb
 
-# Runtime artifacts (generated when notebook runs — not tracked in git)
-artifacts/
+# Runtime artifacts — model files tracked; transient download cache excluded
+artifacts/model_download/
 /tmp/
 
 # Azure ML local caches
