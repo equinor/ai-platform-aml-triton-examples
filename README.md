@@ -185,8 +185,8 @@ ai-platform-aml-triton-examples/
     │   ├── analysis.py                             # Pipeline step 2: evaluate + write report
     │   └── score.py                                # Pipeline step 3: batch inference
     └── triton_scoring/
-        ├── score_ort.py                            # Single-model CPU endpoint (sklearn)
-        ├── score_multi_ort.py                      # Multi-model CPU endpoint (sklearn + numpy)
+        ├── score_ort.py                            # Single-model CPU endpoint (rawhttp, KFServing V2)
+        ├── score_multi_ort.py                      # Multi-model CPU endpoint (model control + cross-worker sync)
         └── score.py                                # GPU endpoint: Triton subprocess proxy
 ```
 
@@ -313,12 +313,103 @@ artifacts/triton_model_repo/
 
 ---
 
+## Reliability & Production Hardening
+
+The scoring scripts include several hardening measures beyond a minimal proof-of-concept.
+
+### Input Validation
+
+Both `score_ort.py` and `score_multi_ort.py` validate every incoming tensor through
+`_parse_v2_tensor()` before calling the model:
+
+| Check | Detail |
+|-------|--------|
+| Tensor name | Must match the expected name (`float_input`, `x`, etc.) |
+| Shape × data consistency | `product(shape)` must equal `len(data)` |
+| Batch size cap | Rejects batches > 1 024 rows (configurable via `_MAX_BATCH`) |
+| Feature count | Last dimension must equal the expected number of features |
+| Finite values | Rejects payloads containing `NaN` or `Inf` |
+
+Validation failures return **HTTP 400** with a JSON `{"error": "..."}` body.
+
+### HTTP Status Codes
+
+`score_ort.py` uses the `@rawhttp` decorator so the scoring function receives the
+full `AMLRequest` and returns an `AMLResponse` with the correct status code:
+
+| Condition | Status |
+|-----------|--------|
+| Method is not POST | 405 |
+| Malformed JSON body | 400 |
+| Missing / invalid input tensor | 400 |
+| Unrecognised model name | 404 |
+| Unhandled server error | 500 |
+| Success | 200 |
+
+### Structured Request Logging
+
+Every request in both scoring scripts emits a single JSON log line to the AML
+inference server log (queryable via Azure Monitor / Log Analytics):
+
+```json
+{"req_id": "a1b2c3d4", "model": "iris_classifier", "status": 200, "latency_ms": 3.7}
+```
+
+| Field | Description |
+|-------|-------------|
+| `req_id` | First 8 chars of a UUID — correlates log lines to a single request |
+| `model` | Model name that handled the request |
+| `status` | HTTP status code returned to the caller |
+| `latency_ms` | Wall-clock time from request receipt to response, in milliseconds |
+
+### Cross-Worker Registry Sync (`score_multi_ort.py`)
+
+gunicorn spins up multiple worker processes; each has its own memory space, so a
+load/unload via one worker would normally be invisible to the others.
+`score_multi_ort.py` uses a file-based, eventually-consistent approach that requires
+no external services (no Redis, no database):
+
+- **Write path** — after every `load` or `unload`, the authoritative worker atomically
+  writes `{"loaded": [...]}` to a shared temp file via `os.replace()` (rename is
+  atomic on POSIX).
+- **Read path** — at the start of every `run()` call, each worker compares the file's
+  `mtime` to its last-seen mtime.  If unchanged, the check costs a single `getmtime()`
+  syscall.  If changed, the worker acquires `_registry_lock` and re-syncs.
+- **Thread safety** — a `threading.Lock` serialises all registry mutations within a
+  single worker process.
+
+This means a load/unload propagates to all workers within one request cycle (typically
+< 100 ms) without any explicit inter-process communication.
+
+### Deployment Timeouts
+
+Long-running Azure SDK operations are guarded by explicit timeouts so notebooks do
+not hang indefinitely on transient Azure API issues:
+
+| Operation | Timeout |
+|-----------|---------|
+| AML pipeline `jobs.stream()` | 2 hours (daemon thread with `.join(timeout=7200)`) |
+| Endpoint create / update `.result()` | 10 minutes |
+| Deployment create / update `.result()` | 30 minutes |
+| Traffic update `.result()` | 5 minutes |
+
+---
+
 ## Key Design Decisions
 
 - **ONNX Runtime backend** — used instead of FIL (Forest Inference Library) because
   FIL is not compiled into the standard `tritonserver:23.08-py3` image.
 - **`score_ort.py` / `score_multi_ort.py` on CPU** — avoids the CUDA dependency of
   native `tritonserver` while maintaining full KFServing V2 API compatibility.
+- **`@rawhttp` decorator in `score_ort.py`** — exposes the raw `AMLRequest` so the
+  function can inspect the HTTP method and return proper 4xx / 5xx `AMLResponse`
+  objects instead of always returning HTTP 200.
+- **`_parse_v2_tensor()` validation helper** — centralised, reusable V2 tensor
+  validator; raises `ValueError` with a descriptive message that is forwarded to the
+  caller as an HTTP 400 body.
+- **File-based cross-worker registry sync** — stdlib-only (`os.replace`, `getmtime`,
+  `threading.Lock`); no external dependency required for eventually-consistent model
+  control across gunicorn workers.
 - **`skl2onnx` with `zipmap=False`** — ensures probability output is a plain
   `float32` array rather than a list-of-dicts, required for Triton ONNX Runtime's
   static output shape declaration.
