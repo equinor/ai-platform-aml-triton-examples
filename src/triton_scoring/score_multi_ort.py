@@ -33,6 +33,10 @@ import json
 import logging
 import os
 import re
+import tempfile
+import threading
+import time
+import uuid
 
 import joblib
 import numpy as np
@@ -59,6 +63,8 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+_MAX_BATCH = 1024   # guard against unreasonably large request payloads
+
 # ── Routing regexes ──────────────────────────────────────────────────────────
 _V2_INFER_RE   = re.compile(r"/v2/models/([^/?\s]+)/infer")
 _V2_READY_RE   = re.compile(r"/v2/models/([^/?\s]+)/ready")
@@ -71,6 +77,146 @@ _V2_HEALTH_RE  = re.compile(r"/v2/health")
 # Maps model_name → {"type": ..., ...model-specific fields...}
 _registry: dict = {}
 _model_dir: str = ""
+
+# ── Cross-worker registry synchronisation ────────────────────────────────────
+# Gunicorn spawns N worker *processes* — each has its own memory space and its
+# own copy of _registry.  A load/unload request handled by worker A would not
+# normally affect workers B, C, D.
+#
+# Fix: whenever the registry changes, atomically write the desired model list
+# to a shared temp file (_STATE_FILE).  Every worker checks that file's mtime
+# at the top of run() and syncs its in-process registry if it is stale.
+#
+# Properties:
+#   • No external dependencies (only os.path.getmtime + json + os.replace)
+#   • Fast path (no change): a single getmtime() syscall, no lock
+#   • Eventually consistent: each worker syncs on its *next* request
+#   • Thread-safe within a worker: _registry_lock protects all mutations
+
+_registry_lock = threading.Lock()
+_STATE_FILE    = os.path.join(tempfile.gettempdir(), "aml_score_multi_registry.json")
+_state_mtime: float = 0.0   # per-process; tracks last-seen mtime of _STATE_FILE
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Validation helper
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _parse_v2_tensor(inp: dict, name: str, n_features: int) -> np.ndarray:
+    """Validate and return a float32 numpy array from a V2 tensor descriptor.
+
+    Raises ValueError for:
+      - Wrong tensor name
+      - Missing 'shape' or 'data' keys
+      - data length != product of shape dimensions
+      - batch size > _MAX_BATCH
+      - unexpected number of features in last dimension
+      - NaN or Inf values
+    """
+    if inp.get("name") != name:
+        raise ValueError(f"Expected tensor '{name}', got '{inp.get('name')}'")
+
+    shape = inp.get("shape")
+    data  = inp.get("data")
+    if shape is None or data is None:
+        raise ValueError(f"Tensor '{name}' is missing 'shape' or 'data'")
+
+    flat = [v for row in data for v in row] if data and isinstance(data[0], list) else list(data)
+    expected_len = 1
+    for d in shape:
+        expected_len *= d
+    if len(flat) != expected_len:
+        raise ValueError(
+            f"Tensor '{name}': shape {shape} implies {expected_len} elements "
+            f"but data has {len(flat)}"
+        )
+
+    if shape[0] > _MAX_BATCH:
+        raise ValueError(
+            f"Batch size {shape[0]} exceeds maximum allowed ({_MAX_BATCH})"
+        )
+
+    if shape[-1] != n_features:
+        raise ValueError(
+            f"Tensor '{name}': expected {n_features} features in last dimension, "
+            f"got {shape[-1]}"
+        )
+
+    arr = np.array(flat, dtype=np.float32).reshape(shape)
+    if not np.isfinite(arr).all():
+        raise ValueError(f"Tensor '{name}' contains NaN or Inf values")
+    return arr
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Cross-worker state helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _save_state() -> None:
+    """Atomically persist the list of currently loaded model names.
+
+    Must be called while holding _registry_lock.
+    Uses os.replace() for an atomic rename — other workers see either the
+    old file or the new one, never a partially-written file.
+    """
+    state = {"loaded": sorted(_registry.keys())}
+    tmp = _STATE_FILE + f".{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, _STATE_FILE)
+    logger.info(f"[state] pid={os.getpid()} wrote registry: {state['loaded']}")
+
+
+def _reload_if_stale() -> None:
+    """Sync this worker's _registry from the shared state file if it has changed.
+
+    Fast path (no change): a single os.path.getmtime() syscall, no lock.
+    Slow path (change detected): acquires _registry_lock, re-checks under
+    lock, then loads/unloads models to match the file's desired list.
+    """
+    global _state_mtime
+    try:
+        mtime = os.path.getmtime(_STATE_FILE)
+    except FileNotFoundError:
+        return  # file not yet written (before the first init() completes)
+
+    if mtime <= _state_mtime:
+        return  # nothing changed — fast path
+
+    with _registry_lock:
+        # Re-read mtime under lock: another thread in this worker may have
+        # already synced while we were waiting to acquire the lock.
+        try:
+            mtime = os.path.getmtime(_STATE_FILE)
+        except FileNotFoundError:
+            return
+        if mtime <= _state_mtime:
+            return
+
+        try:
+            with open(_STATE_FILE) as f:
+                desired = set(json.load(f).get("loaded", []))
+        except Exception as exc:
+            logger.error(f"[state] Could not read state file: {exc}")
+            return
+
+        loaders = {"iris_classifier": _load_iris, "pytorch_sine": _load_pytorch_sine}
+        current = set(_registry.keys())
+
+        for name in current - desired:
+            del _registry[name]
+            logger.info(f"[state] pid={os.getpid()} unloaded '{name}' (synced)")
+
+        for name in desired - current:
+            if name in loaders:
+                try:
+                    _registry[name] = loaders[name](_model_dir)
+                    logger.info(f"[state] pid={os.getpid()} loaded '{name}' (synced)")
+                except Exception as exc:
+                    logger.error(f"[state] pid={os.getpid()} failed to load '{name}': {exc}")
+
+        _state_mtime = mtime
+        logger.info(f"[state] pid={os.getpid()} registry now: {sorted(_registry.keys())}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -122,6 +268,7 @@ def init():
     _model_dir = os.environ.get("AZUREML_MODEL_DIR", "")
     logger.info(f"[init] AZUREML_MODEL_DIR = {_model_dir!r}")
     logger.info(f"[init] rawhttp source     = {_RAWHTTP_SOURCE!r}")
+    logger.info(f"[init] pid                = {os.getpid()}")
 
     for name, loader in [("iris_classifier", _load_iris),
                           ("pytorch_sine",    _load_pytorch_sine)]:
@@ -130,6 +277,10 @@ def init():
             logger.info(f"[init] {name} — loaded OK")
         except Exception as exc:
             logger.error(f"[init] {name} — FAILED: {exc}", exc_info=True)
+
+    # Write initial shared state so workers started later can sync from it.
+    with _registry_lock:
+        _save_state()
 
     logger.info(f"[init] Models ready: {sorted(_registry)}")
 
@@ -141,13 +292,10 @@ def init():
 def _infer_iris(payload: dict) -> dict:
     """Run iris_classifier sklearn inference."""
     sk = _registry["iris_classifier"]["model"]
-    X = None
-    for inp in payload.get("inputs", []):
-        if inp["name"] == "float_input":
-            X = np.array(inp["data"], dtype=np.float32).reshape(inp["shape"])
-            break
-    if X is None:
-        raise ValueError("Input tensor 'float_input' not found in request")
+    inp = next((i for i in payload.get("inputs", []) if i.get("name") == "float_input"), None)
+    if inp is None:
+        raise ValueError("Required input tensor 'float_input' not found in request")
+    X = _parse_v2_tensor(inp, "float_input", n_features=4)
 
     labels = sk.predict(X).astype(np.int64).tolist()
     probas = sk.predict_proba(X).astype(np.float32).tolist()
@@ -171,13 +319,10 @@ def _relu(x: np.ndarray) -> np.ndarray:
 def _infer_pytorch_sine(payload: dict) -> dict:
     """Run pytorch_sine MLP via pure-numpy forward pass."""
     e = _registry["pytorch_sine"]
-    X = None
-    for inp in payload.get("inputs", []):
-        if inp["name"] == "x":
-            X = np.array(inp["data"], dtype=np.float32).reshape(inp["shape"])
-            break
-    if X is None:
-        raise ValueError("Input tensor 'x' not found in request")
+    inp = next((i for i in payload.get("inputs", []) if i.get("name") == "x"), None)
+    if inp is None:
+        raise ValueError("Required input tensor 'x' not found in request")
+    X = _parse_v2_tensor(inp, "x", n_features=1)
 
     # Forward pass: MLP(1 → hidden → hidden → 1) with ReLU activations
     h = _relu(X @ e["W1"].T + e["b1"])
@@ -212,9 +357,14 @@ def _err(msg: str, status: int = 400) -> "AMLResponse":
     return AMLResponse(json.dumps({"error": msg}), status)
 
 
-def _dispatch(model_name: str, payload: dict) -> "AMLResponse":
+def _dispatch(model_name: str, payload: dict, req_id: str = "") -> "AMLResponse":
     """Route inference request to the correct model handler."""
+    t0 = time.perf_counter()
     if model_name not in _registry:
+        logger.info(json.dumps({
+            "req_id": req_id, "model": model_name,
+            "status": 404, "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
+        }))
         return _err(
             f"Model '{model_name}' is not loaded. "
             f"Available: {sorted(_registry)}",
@@ -222,9 +372,17 @@ def _dispatch(model_name: str, payload: dict) -> "AMLResponse":
         )
     try:
         result = _HANDLERS[model_name](payload)
+        logger.info(json.dumps({
+            "req_id": req_id, "model": model_name,
+            "status": 200, "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
+        }))
         return _ok(result)
     except Exception as exc:
-        logger.error(f"[{model_name}] Inference error: {exc}", exc_info=True)
+        logger.error(f"[{model_name}] req_id={req_id} Inference error: {exc}", exc_info=True)
+        logger.info(json.dumps({
+            "req_id": req_id, "model": model_name,
+            "status": 500, "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
+        }))
         return _err(str(exc), status=500)
 
 
@@ -244,7 +402,11 @@ def run(request: "AMLRequest") -> "AMLResponse":
 
     Also handles V2 management endpoints (health, readiness, model control).
     """
+    # Sync registry from shared state file if another worker changed it
+    _reload_if_stale()
+
     # Extract request metadata safely
+    req_id = str(uuid.uuid4())[:8]
     path   = getattr(request, "full_path", None) or getattr(request, "path", "") or ""
     method = (getattr(request, "method", "POST") or "POST").upper()
 
@@ -254,7 +416,7 @@ def run(request: "AMLRequest") -> "AMLResponse":
     except Exception:
         args = {}
 
-    logger.info(f"[run] {method} {path}")
+    logger.info(f"[run] req_id={req_id} {method} {path}")
 
     # ── Server health ────────────────────────────────────────────────────
     if _V2_HEALTH_RE.search(path):
@@ -285,7 +447,9 @@ def run(request: "AMLRequest") -> "AMLResponse":
         if mn not in loaders:
             return _err(f"Unknown model '{mn}'", 404)
         try:
-            _registry[mn] = loaders[mn](_model_dir)
+            with _registry_lock:
+                _registry[mn] = loaders[mn](_model_dir)
+                _save_state()   # propagate change to all other workers
             return _ok({"model": mn, "state": "READY"})
         except Exception as exc:
             return _err(str(exc), 500)
@@ -294,10 +458,12 @@ def run(request: "AMLRequest") -> "AMLResponse":
     m = _V2_UNLOAD_RE.search(path)
     if m and method == "POST":
         mn = m.group(1)
-        if mn in _registry:
+        with _registry_lock:
+            if mn not in _registry:
+                return _err(f"Model '{mn}' not loaded", 404)
             del _registry[mn]
-            return _ok({"model": mn, "state": "UNLOADED"})
-        return _err(f"Model '{mn}' not loaded", 404)
+            _save_state()   # propagate change to all other workers
+        return _ok({"model": mn, "state": "UNLOADED"})
 
     # ── Inference (POST only) ────────────────────────────────────────────
     if method != "POST":
@@ -315,18 +481,18 @@ def run(request: "AMLRequest") -> "AMLResponse":
     # Priority 1: Triton-style path  /v2/models/{model_name}/infer
     m = _V2_INFER_RE.search(path)
     if m:
-        return _dispatch(m.group(1), payload)
+        return _dispatch(m.group(1), payload, req_id)
 
     # Priority 2: query parameter  ?model={model_name}
     model_name = args.get("model", [""])[0] if isinstance(args.get("model"), list) \
                  else args.get("model", "")
     if model_name:
-        return _dispatch(model_name, payload)
+        return _dispatch(model_name, payload, req_id)
 
     # Priority 3: body field  {"model_name": "..."}
     model_name = payload.get("model_name", "")
     if model_name:
-        return _dispatch(model_name, payload)
+        return _dispatch(model_name, payload, req_id)
 
     # No routing information — return helpful error
     return _err(
