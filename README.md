@@ -332,6 +332,32 @@ are exported in the current shell:
 | `API_KEY` | Yes | Azure ML studio → Endpoints → your endpoint → Consume tab → Primary key |
 | `VERIFY_SSL` | No (default `0`) | Set to `1` to enable TLS certificate verification. Leave unset (or `0`) when the endpoint sits behind a reverse proxy with a private CA certificate (e.g. `unified.aurora.equinor.com`) — equivalent to `curl -k` / `requests.get(..., verify=False)`. |
 
+**What is an SSL certificate and why does it matter here?**
+
+An SSL certificate is a digital ID card that a server presents when you open an
+HTTPS connection. Your client checks that the certificate was signed by a trusted
+authority (a Certificate Authority, or CA). If the check passes the connection is
+encrypted; if it fails the connection is refused.
+
+```
+  You (client)                         Server
+       │                                  │
+       │──── "Hello, who are you?" ──────►│
+       │◄─── Certificate ─────────────────│
+       │                                  │
+       │  Is this signed by a trusted CA? │
+       │  ┌──────────────────────────┐    │
+       │  │ YES → encrypt & proceed  │    │
+       │  │ NO  → connection refused │    │
+       │  └──────────────────────────┘    │
+```
+
+The `unified.aurora.equinor.com` gateway uses a **private corporate CA** whose
+root certificate is not included in Python's default trust store. Setting
+`VERIFY_SSL=0` tells the test client to skip the certificate check (equivalent
+to `curl -k`) — this is safe because the tests run inside the same private
+network as the gateway and the API key still authenticates each request.
+
 Or retrieve them via the Azure CLI:
 
 ```bash
@@ -481,6 +507,29 @@ Validation failures return **HTTP 400** with a JSON `{"error": "..."}` body.
 
 ### HTTP Status Codes
 
+**What is the `@rawhttp` decorator and why is it needed?**
+
+By default the AML inference server unwraps the incoming JSON body into a plain
+Python dict and passes it to `run(data)`. The return value is also wrapped and
+sent back as **HTTP 200 every time** — even when something went wrong. Callers
+have no standard way to tell success from failure.
+
+The `@rawhttp` decorator opts out of that wrapping. The scoring function instead
+receives the full HTTP request object (`AMLRequest`) and is responsible for
+building and returning an `AMLResponse` with the correct status code.
+
+```
+  Default AML mode                    @rawhttp mode
+  ────────────────────────────────    ──────────────────────────────────────
+  run(data: dict) → dict              run(request: AMLRequest) → AMLResponse
+         │                                   │
+         │ AML always responds               ├─ wrong method  → 405
+         │ with HTTP 200                     ├─ malformed JSON → 400
+         ▼                                   ├─ bad tensor     → 400
+  HTTP 200 OK                                ├─ server error   → 500
+  (even for errors!)                         └─ success        → 200
+```
+
 `score_ort.py` uses the `@rawhttp` decorator so the scoring function receives the
 full `AMLRequest` and returns an `AMLResponse` with the correct status code:
 
@@ -516,19 +565,58 @@ inference server log (queryable via Azure Monitor / Log Analytics):
 
 ### Cross-Worker Registry Sync (`score_multi_ort.py`)
 
-gunicorn spins up multiple worker processes; each has its own memory space, so a
-load/unload via one worker would normally be invisible to the others.
-`score_multi_ort.py` uses a file-based, eventually-consistent approach that requires
-no external services (no Redis, no database):
+**What is the problem?**
+
+The AML inference container runs **gunicorn**, which forks several worker
+processes to handle requests in parallel. Each process has its own isolated
+memory. If a `POST /v2/repository/models/iris_classifier/unload` request lands
+on Worker A, Worker A removes `iris_classifier` from its in-memory registry —
+but Workers B, C, and D still have it loaded and will keep serving it. The
+registry is out of sync.
+
+**The solution — a shared state file**
+
+`score_multi_ort.py` uses a plain JSON file in `/tmp` as a lightweight message
+board. Whenever any worker changes the registry it atomically overwrites the
+file. Every other worker checks the file's modification time at the start of
+each request and reloads if it has changed.
+
+```
+  ┌─────────────────────────────────────────────────────┐
+  │                     AKS Pod                         │
+  │                                                     │
+  │  ┌────────────────┐         ┌────────────────┐      │
+  │  │   Worker A     │         │   Worker B     │      │
+  │  │                │         │                │      │
+  │  │ _registry:     │         │ _registry:     │      │
+  │  │ {iris, sine}   │         │ {iris, sine}   │      │
+  │  └───────┬────────┘         └───────┬────────┘      │
+  │          │                          │               │
+  │  POST /unload iris          on next request:        │
+  │  del _registry["iris"]      getmtime() → changed!   │
+  │  os.replace(file) ─────────────────► reload from    │
+  │          │                          │  state file   │
+  │          ▼                          ▼               │
+  │  ┌──────────────────────────────────────────────┐   │
+  │  │  /tmp/aml_score_multi_registry.json          │   │
+  │  │  { "loaded": ["pytorch_sine"] }              │   │
+  │  └──────────────────────────────────────────────┘   │
+  └─────────────────────────────────────────────────────┘
+```
+
+Key properties of this approach:
 
 - **Write path** — after every `load` or `unload`, the authoritative worker atomically
   writes `{"loaded": [...]}` to a shared temp file via `os.replace()` (rename is
-  atomic on POSIX).
+  atomic on POSIX, so readers always see either the old or the new file, never a
+  half-written one).
 - **Read path** — at the start of every `run()` call, each worker compares the file's
   `mtime` to its last-seen mtime.  If unchanged, the check costs a single `getmtime()`
   syscall.  If changed, the worker acquires `_registry_lock` and re-syncs.
 - **Thread safety** — a `threading.Lock` serialises all registry mutations within a
   single worker process.
+- **No external dependency** — only Python stdlib; no Redis, message queue, or
+  database required.
 
 This means a load/unload propagates to all workers within one request cycle (typically
 < 100 ms) without any explicit inter-process communication.
