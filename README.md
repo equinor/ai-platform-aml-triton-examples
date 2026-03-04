@@ -171,23 +171,34 @@ Response:
 ai-platform-aml-triton-examples/
 ├── train-on-ai-platform-aks-triton.ipynb          # Single-model notebook
 ├── train-on-ai-platform-aks-triton-n-models.ipynb # Multi-model notebook
-├── requirements.txt                                # Python dependencies
+├── requirements.txt                                # Runtime Python dependencies
+├── requirements-dev.txt                            # Dev/test dependencies (pytest, pytest-mock)
+├── pytest.ini                                      # Test configuration (testpaths, pythonpath, markers)
 ├── .gitignore
 ├── README.md
 ├── artifacts/                                      # Runtime outputs (gitignored)
 │   ├── model_download/                             #   model.pkl downloaded from AML
 │   └── triton_model_repo/                          #   Triton model repo built locally
-└── src/
-    ├── _helpers/
-    │   └── load_tags.py                            # Reads Kubernetes ConfigMap tags
-    ├── iris_pipeline/
-    │   ├── train.py                                # Pipeline step 1: train + save model.pkl
-    │   ├── analysis.py                             # Pipeline step 2: evaluate + write report
-    │   └── score.py                                # Pipeline step 3: batch inference
-    └── triton_scoring/
-        ├── score_ort.py                            # Single-model CPU endpoint (rawhttp, KFServing V2)
-        ├── score_multi_ort.py                      # Multi-model CPU endpoint (model control + cross-worker sync)
-        └── score.py                                # GPU endpoint: Triton subprocess proxy
+├── src/
+│   ├── _helpers/
+│   │   └── load_tags.py                            # Reads Kubernetes ConfigMap tags
+│   ├── iris_pipeline/
+│   │   ├── train.py                                # Pipeline step 1: train + save model.pkl
+│   │   ├── analysis.py                             # Pipeline step 2: evaluate + write report
+│   │   └── score.py                                # Pipeline step 3: batch inference
+│   └── triton_scoring/
+│       ├── score_ort.py                            # Single-model CPU endpoint (rawhttp, KFServing V2)
+│       ├── score_multi_ort.py                      # Multi-model CPU endpoint (model control + cross-worker sync)
+│       └── score.py                                # GPU endpoint: Triton subprocess proxy
+└── tests/
+    ├── aml_stubs.py                                # AMLRequest / AMLResponse / rawhttp stubs
+    ├── conftest.py                                 # Stub injection + shared pytest fixtures
+    ├── unit/
+    │   ├── test_score_ort.py                       # Unit tests for score_ort.py
+    │   ├── test_score_multi_ort.py                 # Unit tests for score_multi_ort.py
+    │   └── test_train.py                           # Unit tests for train.py (subprocess)
+    └── integration/
+        └── test_endpoint_live.py                   # Live-endpoint smoke tests (skipped by default)
 ```
 
 ---
@@ -226,6 +237,142 @@ jupyter lab
 - **Multiple models**: open `train-on-ai-platform-aks-triton-n-models.ipynb`
 
 Run all cells top-to-bottom.
+
+---
+
+## Testing
+
+The repository ships with a self-contained test suite that runs entirely
+**without AML credentials, a deployed endpoint, or a GPU**.
+
+### Test structure
+
+```
+tests/
+├── aml_stubs.py                  # Lightweight AMLRequest / AMLResponse / rawhttp stubs
+├── conftest.py                   # Stub injection + shared fixtures (iris_model, model_dir, …)
+├── unit/
+│   ├── test_score_ort.py         # 24 tests — _parse_v2_tensor, init(), run() for score_ort.py
+│   ├── test_score_multi_ort.py   # 27 tests — routing, model control, reload, init for score_multi_ort.py
+│   └── test_train.py             #  5 tests — train.py exercised end-to-end via subprocess
+└── integration/
+    └── test_endpoint_live.py     #  8 tests — smoke tests against a live AML endpoint (skipped by default)
+pytest.ini                        # testpaths, pythonpath=src, marker definitions
+requirements-dev.txt              # pytest>=7.4, pytest-mock>=3.12
+```
+
+### 1. Install dev dependencies
+
+```bash
+cd ai-platform-aml-triton-examples
+pip install -r requirements-dev.txt
+```
+
+### 2. Run the unit tests
+
+```bash
+pytest tests/unit/ -v
+```
+
+Expected output (all 56 tests passing):
+
+```
+tests/unit/test_score_multi_ort.py::TestRelu::test_positive_values_pass_through PASSED
+tests/unit/test_score_multi_ort.py::TestInferenceRouting::test_query_param_routes_iris PASSED
+...
+tests/unit/test_score_ort.py::TestRun::test_returns_200 PASSED
+tests/unit/test_train.py::test_accuracy_at_least_90_percent PASSED
+...
+========================== 56 passed in 7s =====================================
+```
+
+### 3. Reading the output
+
+| Symbol | Meaning |
+|--------|---------|
+| `PASSED` | Test passed |
+| `FAILED` | Assertion failed — full diff is printed below the run summary |
+| `ERROR` | Unexpected exception during test setup or teardown |
+| `SKIPPED` | Test was intentionally skipped (integration tests without env vars set) |
+
+When a test fails, pytest prints the assertion and a contextual diff, for example:
+
+```
+FAILED tests/unit/test_score_ort.py::TestRun::test_returns_200
+E   assert 400 == 200
+E    +  where 400 = <AMLResponse object>.status_code
+```
+
+Useful flags for investigating failures:
+
+```bash
+# Show full traceback instead of the short summary
+pytest tests/unit/ -v --tb=long
+
+# Re-run only the tests that failed in the last run
+pytest tests/unit/ -v --last-failed
+
+# Run a specific file, class, or single test
+pytest tests/unit/test_score_ort.py -v
+pytest tests/unit/test_score_multi_ort.py::TestInferenceRouting -v
+pytest tests/unit/test_score_ort.py::TestRun::test_returns_200 -v
+
+# Stop after the first failure
+pytest tests/unit/ -v -x
+```
+
+### 4. Integration tests (requires a live endpoint)
+
+Integration tests are **skipped automatically** unless both environment variables
+are exported in the current shell:
+
+| Variable | Required | Where to find it |
+|----------|----------|-----------------|
+| `ENDPOINT_URL` | Yes | Azure ML studio → Endpoints → your endpoint → Consume tab → REST endpoint |
+| `API_KEY` | Yes | Azure ML studio → Endpoints → your endpoint → Consume tab → Primary key |
+| `VERIFY_SSL` | No (default `0`) | Set to `1` to enable TLS certificate verification. Leave unset (or `0`) when the endpoint sits behind a reverse proxy with a private CA certificate (e.g. `unified.aurora.equinor.com`) — equivalent to `curl -k` / `requests.get(..., verify=False)`. |
+
+Or retrieve them via the Azure CLI:
+
+```bash
+export ENDPOINT_URL=$(az ml online-endpoint show \
+    -n <endpoint-name> --query scoring_uri -o tsv)
+export API_KEY=$(az ml online-endpoint get-credentials \
+    -n <endpoint-name> --query primaryKey -o tsv)
+```
+
+Then run:
+
+```bash
+pytest tests/integration/ -m integration -v
+```
+
+Expected output when the endpoint is healthy:
+
+```
+tests/integration/test_endpoint_live.py::TestIrisClassifier::test_single_row_returns_200 PASSED
+tests/integration/test_endpoint_live.py::TestIrisClassifier::test_predicted_class_is_valid PASSED
+tests/integration/test_endpoint_live.py::TestIrisClassifier::test_probabilities_sum_to_one PASSED
+tests/integration/test_endpoint_live.py::TestIrisClassifier::test_batch_of_three_rows PASSED
+tests/integration/test_endpoint_live.py::TestPytorchSine::test_sine_of_half_pi_approx_one PASSED
+tests/integration/test_endpoint_live.py::TestErrorHandling::test_unknown_model_returns_4xx PASSED
+tests/integration/test_endpoint_live.py::TestErrorHandling::test_shape_mismatch_returns_error PASSED
+tests/integration/test_endpoint_live.py::TestErrorHandling::test_missing_auth_returns_401_or_403 PASSED
+========================== 8 passed in 3.2s ====================================
+```
+
+Without env vars set, every test is skipped with a clear reason:
+
+```
+tests/integration/test_endpoint_live.py::TestIrisClassifier::test_single_row_returns_200
+SKIPPED (ENDPOINT_URL and API_KEY environment variables must be set)
+...
+========================== 8 skipped in 0.1s ===================================
+```
+
+> **Note:** `TestPytorchSine::test_sine_of_half_pi_approx_one` targets the
+> multi-model endpoint from `train-on-ai-platform-aks-triton-n-models.ipynb`.
+> Point `ENDPOINT_URL` at the correct endpoint for the model you want to test.
 
 ---
 
@@ -345,6 +492,11 @@ full `AMLRequest` and returns an `AMLResponse` with the correct status code:
 | Unrecognised model name | 404 |
 | Unhandled server error | 500 |
 | Success | 200 |
+
+> **AKS gateway note:** The Kubernetes Online Endpoint gateway may convert a
+> `500` returned by the scoring container into `502 Bad Gateway` before the
+> response reaches the caller. Client code and integration tests should treat
+> `500` and `502` as equivalent server-error signals.
 
 ### Structured Request Logging
 
