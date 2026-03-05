@@ -8,10 +8,11 @@ Kubernetes Online Endpoints** with a Triton-compatible KFServing V2 API.
 
 ## Notebooks
 
-| Notebook | Description |
-|----------|-------------|
-| [`train-on-ai-platform-aks-triton.ipynb`](#single-model-notebook) | Train one scikit-learn Iris classifier, deploy it as a single-model KFServing V2 endpoint |
-| [`train-on-ai-platform-aks-triton-n-models.ipynb`](#multi-model-notebook) | Train sklearn + PyTorch models, deploy **both** to a single endpoint with model control mode |
+| Notebook | Output | Description |
+|----------|--------|-------------|
+| [`train-on-ai-platform-aks-triton.ipynb`](#single-model-notebook) | — | Train one scikit-learn Iris classifier, deploy it as a single-model KFServing V2 endpoint via AzureML Online Endpoint |
+| [`train-on-ai-platform-aks-triton-n-models.ipynb`](#multi-model-notebook) | — | Train sklearn + PyTorch models, deploy **both** to a single endpoint with model control mode |
+| [`sklearn-triton-kserve-deployment.ipynb`](#kserve-notebook) | [`sklearn-triton-kserve-deployment-output.ipynb`](sklearn-triton-kserve-deployment-output.ipynb) | Fetch the latest registered Triton model from AML, deploy directly to **KServe** (no AzureML Online Endpoint, no retraining) |
 
 ---
 
@@ -165,13 +166,103 @@ Response:
 
 ---
 
+## KServe Notebook
+
+`sklearn-triton-kserve-deployment.ipynb` · output: `sklearn-triton-kserve-deployment-output.ipynb`
+
+### What it does
+
+Deploys an already-registered Triton model to **KServe** running inside the same AKS cluster.
+No pipeline retraining, no AzureML Online Endpoint — the model is served by the native Triton
+Inference Server via the KServe `InferenceService` CRD.
+
+| Step | Description |
+|------|-------------|
+| 1 | Fetch the latest `triton_model` from the AML model registry by name or prefix |
+| 2 | Blob-existence check to skip registrations that lack the required model subdirectory |
+| 3 | Download the model repository locally to verify layout and extract metadata |
+| 4 | Patch `config.pbtxt` (`max_batch_size: 0`, correct tensor dims) and re-upload to Azure Blob |
+| 5 | Resolve the `https://` blob storage URI that KServe will download from |
+| 6 | Retrieve the Azure storage account key via the Storage Management API |
+| 7 | Create a K8s `Secret` with blob credentials; patch `mlpipeline-minio-artifact` so the KServe storage initializer can authenticate |
+| 8 | Create a KServe `InferenceService` with `V1beta1TritonSpec` and `storageUri` pointing at the Triton model repository |
+| 9 | Poll until the `InferenceService` reaches `Ready = True` (10-minute timeout) |
+| 10 | Resolve cluster-internal ClusterIP service URL (external URL not reachable from inside the pod) |
+| 11 | Test the Triton endpoint with a KFServing V2 inference request |
+
+### Key differences from `train-on-ai-platform-aks-triton.ipynb`
+
+| | AzureML Endpoint notebook | KServe notebook |
+|-|--------------------------|-----------------|
+| **Serving runtime** | `score_ort.py` (sklearn + joblib) | Native Triton Inference Server |
+| **Deployment target** | AzureML `KubernetesOnlineEndpoint` | KServe `InferenceService` CRD |
+| **Retraining** | Full AML pipeline (train → analyse → batch-score) | None — fetches existing registered model |
+| **GPU required** | No (CPU-only via `score_ort.py`) | No (`KIND_CPU` in `config.pbtxt`) |
+| **Auth** | AML API key in `Authorization: Bearer` header | None by default (KServe cluster-internal) |
+
+### Inference API
+
+**Request** (identical to the AzureML endpoint):
+```json
+{
+  "inputs": [{
+    "name": "float_input",
+    "shape": [1, 4],
+    "datatype": "FP32",
+    "data": [[5.1, 3.5, 1.4, 0.2]]
+  }]
+}
+```
+
+**Response:**
+```json
+{
+  "model_name": "iris_classifier",
+  "model_version": "1",
+  "outputs": [
+    {"name": "label",         "shape": [1],    "datatype": "INT64", "data": [0]},
+    {"name": "probabilities", "shape": [1, 3], "datatype": "FP32",  "data": [1.0, 0.0, 0.0]}
+  ]
+}
+```
+
+### Prerequisites
+
+- A `triton_model` already registered in the AML model registry containing an
+  `iris_classifier/` subdirectory with `config.pbtxt` and `1/model.onnx`
+  (created by running `train-on-ai-platform-aks-triton.ipynb` at least once)
+- KServe installed in the target AKS cluster (`kubectl get crds | grep inferenceservice`)
+- Notebook running **inside** the AKS cluster (in-cluster K8s config)
+- Managed Identity on the notebook pod with `Storage Account Contributor` (or
+  `Microsoft.Storage/storageAccounts/listkeys/action`) on the AML storage account
+
+### Cluster-internal URL resolution
+
+KServe's `status.url` points to an external ingress hostname that is not
+DNS-resolvable from within the AKS cluster. The notebook automatically discovers
+the ClusterIP service created by Knative for the predictor revision:
+
+```python
+# Label selector used to find the ClusterIP service
+serving.knative.dev/service=iris-triton-predictor
+```
+
+The resulting URL has the form:
+```
+http://iris-triton-predictor-00001.unified.svc.cluster.local/v2/models/iris_classifier/infer
+```
+
+---
+
 ## Repository Structure
 
 ```
 ai-platform-aml-triton-examples/
-├── train-on-ai-platform-aks-triton.ipynb          # Single-model notebook
-├── train-on-ai-platform-aks-triton-n-models.ipynb # Multi-model notebook
-├── requirements.txt                                # Runtime Python dependencies
+├── train-on-ai-platform-aks-triton.ipynb              # Single-model notebook (AzureML endpoint)
+├── train-on-ai-platform-aks-triton-n-models.ipynb     # Multi-model notebook (AzureML endpoint)
+├── sklearn-triton-kserve-deployment.ipynb             # KServe notebook (no retraining, no AML endpoint)
+├── sklearn-triton-kserve-deployment-output.ipynb      # Last successful execution output
+├── requirements.txt                                    # Runtime Python dependencies
 ├── requirements-dev.txt                            # Dev/test dependencies (pytest, pytest-mock)
 ├── pytest.ini                                      # Test configuration (testpaths, pythonpath, markers)
 ├── .gitignore
@@ -233,8 +324,9 @@ jupyter lab
 
 ### 3. Open and run a notebook
 
-- **Single model**: open `train-on-ai-platform-aks-triton.ipynb`
-- **Multiple models**: open `train-on-ai-platform-aks-triton-n-models.ipynb`
+- **Single model** (train + AzureML endpoint): open `train-on-ai-platform-aks-triton.ipynb`
+- **Multiple models** (train + AzureML endpoint): open `train-on-ai-platform-aks-triton-n-models.ipynb`
+- **KServe deployment** (no retraining, no AzureML endpoint): open `sklearn-triton-kserve-deployment.ipynb`
 
 Run all cells top-to-bottom.
 
