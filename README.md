@@ -10,8 +10,8 @@ Kubernetes Online Endpoints** with a Triton-compatible KFServing V2 API.
 
 | Notebook | Output | Description |
 |----------|--------|-------------|
-| [`train-on-ai-platform-aks-triton.ipynb`](#single-model-notebook) | — | Train one scikit-learn Iris classifier, deploy it as a single-model KFServing V2 endpoint via AzureML Online Endpoint |
-| [`train-on-ai-platform-aks-triton-n-models.ipynb`](#multi-model-notebook) | — | Train sklearn + PyTorch models, deploy **both** to a single endpoint with model control mode |
+| [`train-on-ai-platform-aks-triton.ipynb`](#single-model-notebook) | [`train-on-ai-platform-aks-triton-output.ipynb`](train-on-ai-platform-aks-triton-output.ipynb) | Train one scikit-learn Iris classifier, deploy it as a single-model KFServing V2 endpoint via AzureML Online Endpoint |
+| [`train-on-ai-platform-aks-triton-n-models.ipynb`](#multi-model-notebook) | [`train-on-ai-platform-aks-triton-n-models-output.ipynb`](train-on-ai-platform-aks-triton-n-models-output.ipynb) | Train sklearn + PyTorch models, deploy **both** to a single endpoint with model control mode |
 | [`sklearn-triton-kserve-deployment.ipynb`](#kserve-notebook) | [`sklearn-triton-kserve-deployment-output.ipynb`](sklearn-triton-kserve-deployment-output.ipynb) | Fetch the latest registered Triton model from AML, deploy directly to **KServe** (no AzureML Online Endpoint, no retraining) |
 
 ---
