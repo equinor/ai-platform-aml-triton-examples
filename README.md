@@ -12,7 +12,8 @@ Kubernetes Online Endpoints** with a Triton-compatible KFServing V2 API.
 |----------|--------|-------------|
 | [`train-on-ai-platform-aks-triton.ipynb`](#single-model-notebook) | [`train-on-ai-platform-aks-triton-output.ipynb`](train-on-ai-platform-aks-triton-output.ipynb) | Train one scikit-learn Iris classifier, deploy it as a single-model KFServing V2 endpoint via AzureML Online Endpoint |
 | [`train-on-ai-platform-aks-triton-n-models.ipynb`](#multi-model-notebook) | [`train-on-ai-platform-aks-triton-n-models-output.ipynb`](train-on-ai-platform-aks-triton-n-models-output.ipynb) | Train sklearn + PyTorch models, deploy **both** to a single endpoint with model control mode |
-| [`sklearn-triton-kserve-deployment.ipynb`](#kserve-notebook) | [`sklearn-triton-kserve-deployment-output.ipynb`](sklearn-triton-kserve-deployment-output.ipynb) | Fetch the latest registered Triton model from AML, deploy directly to **KServe** (no AzureML Online Endpoint, no retraining) |
+| [`sklearn-triton-kserve-deployment.ipynb`](#kserve-sklearn-notebook) | [`sklearn-triton-kserve-deployment-output.ipynb`](sklearn-triton-kserve-deployment-output.ipynb) | Fetch the latest `iris_classifier` Triton model from AML, deploy directly to **KServe** (no AzureML Online Endpoint, no retraining) |
+| [`pytorch-triton-kserve-deployment.ipynb`](#kserve-pytorch-notebook) | [`pytorch-triton-kserve-deployment-output.ipynb`](pytorch-triton-kserve-deployment-output.ipynb) | Fetch the latest `pytorch_sine` Triton model from AML, deploy directly to **KServe** using explicit model control mode |
 
 ---
 
@@ -166,7 +167,7 @@ Response:
 
 ---
 
-## KServe Notebook
+## KServe Sklearn Notebook
 
 `sklearn-triton-kserve-deployment.ipynb` · output: [`sklearn-triton-kserve-deployment-output.ipynb`](sklearn-triton-kserve-deployment-output.ipynb)
 
@@ -246,14 +247,86 @@ Class mapping: `0 = setosa`, `1 = versicolor`, `2 = virginica`
 
 ---
 
+## KServe PyTorch Notebook
+
+`pytorch-triton-kserve-deployment.ipynb` · output: [`pytorch-triton-kserve-deployment-output.ipynb`](pytorch-triton-kserve-deployment-output.ipynb)
+
+Deploys the pre-trained `pytorch_sine` MLP to **KServe** using the native Triton Inference
+Server — no retraining, no AzureML Online Endpoint. The model approximates `y = sin(x)`
+over `[-π, π]` and was registered by `train-on-ai-platform-aks-triton-n-models.ipynb`.
+
+### vs. `sklearn-triton-kserve-deployment.ipynb`
+
+| | sklearn KServe notebook | PyTorch KServe notebook |
+|-|------------------------|------------------------|
+| **Model** | `iris_classifier` (RandomForest → ONNX) | `pytorch_sine` (3-layer MLP → ONNX) |
+| **Task** | Multi-class classification | Sine-wave regression |
+| **config.pbtxt** | Patched (`max_batch_size: 0`, explicit dims) | No patch needed (2D ONNX output matches config) |
+| **Model isolation** | Full repo loaded (both models) | `--model-control-mode=explicit --load-model=pytorch_sine` |
+
+### Notebook sections
+
+#### Section 1 — Initial Setup & Configuration
+Same package install, config variables, imports, and workspace connection as the sklearn notebook.
+`inference_service_name = "pytorch-triton"` and `required_triton_model_name = "pytorch_sine"`.
+
+#### Section 2 — Model Preparation
+
+| Step | Description |
+|------|-------------|
+| 2.1 | Fetch latest `triton_model` with a `pytorch_sine/` subdirectory from AML registry |
+| 2.2 | Download locally; verify `model.onnx` exists and extract input dimension |
+| 2.3 | Resolve `https://` blob URI for the Triton model repository root |
+| 2.4 | Retrieve Azure storage account key via Storage Management API |
+| 2.5 | **Verify** (not patch) `config.pbtxt` — `pytorch_sine` config is compatible as-is |
+
+#### Section 3 — Inference Service Setup, Configuration & Deployment
+
+| Step | Description |
+|------|-------------|
+| 3.1 | Configure Kubernetes client (in-cluster preferred) |
+| 3.2 | Create `azure-storage-secret`; patch `mlpipeline-minio-artifact.secretkey` |
+| 3.3 | Deploy `InferenceService` with Triton args `--model-control-mode=explicit --load-model=pytorch_sine` to prevent Triton from attempting to load `iris_classifier` (which has a config incompatibility in the same repo) |
+| 3.4 | Poll until `Ready = True` |
+| 3.5 | Resolve cluster-internal ClusterIP service URL |
+
+#### Section 4 — Inference Service Testing
+Sends three test values (`π/2`, `π`, `0`) and verifies each predicted `y` is within `0.05`
+of the true `sin(x)`.
+
+### Inference API
+
+**Request:**
+```json
+{"inputs": [{"name": "x", "shape": [1, 1], "datatype": "FP32", "data": [[1.5708]]}]}
+```
+
+**Response:**
+```json
+{
+  "model_name": "pytorch_sine", "model_version": "1",
+  "outputs": [{"name": "y", "shape": [1, 1], "datatype": "FP32", "data": [0.9988]}]
+}
+```
+
+### Prerequisites
+
+- `train-on-ai-platform-aks-triton-n-models.ipynb` run at least once (registers the multi-model
+  Triton repo containing `pytorch_sine/` in AML)
+- Same cluster/identity requirements as the sklearn KServe notebook
+
+---
+
 ## Repository Structure
 
 ```
 ai-platform-aml-triton-examples/
 ├── train-on-ai-platform-aks-triton.ipynb              # Single-model notebook (AzureML endpoint)
 ├── train-on-ai-platform-aks-triton-n-models.ipynb     # Multi-model notebook (AzureML endpoint)
-├── sklearn-triton-kserve-deployment.ipynb             # KServe notebook (no retraining, no AML endpoint)
+├── sklearn-triton-kserve-deployment.ipynb             # KServe notebook — iris_classifier (sklearn)
 ├── sklearn-triton-kserve-deployment-output.ipynb      # Last successful execution output
+├── pytorch-triton-kserve-deployment.ipynb             # KServe notebook — pytorch_sine (MLP sine)
+├── pytorch-triton-kserve-deployment-output.ipynb      # Last successful execution output
 ├── requirements.txt                                    # Runtime Python dependencies
 ├── requirements-dev.txt                            # Dev/test dependencies (pytest, pytest-mock)
 ├── pytest.ini                                      # Test configuration (testpaths, pythonpath, markers)
@@ -318,7 +391,8 @@ jupyter lab
 
 - **Single model** (train + AzureML endpoint): open `train-on-ai-platform-aks-triton.ipynb`
 - **Multiple models** (train + AzureML endpoint): open `train-on-ai-platform-aks-triton-n-models.ipynb`
-- **KServe deployment** (no retraining, no AzureML endpoint): open `sklearn-triton-kserve-deployment.ipynb`
+- **KServe — iris classifier** (no retraining, no AzureML endpoint): open `sklearn-triton-kserve-deployment.ipynb`
+- **KServe — pytorch sine** (no retraining, no AzureML endpoint): open `pytorch-triton-kserve-deployment.ipynb`
 
 Run all cells top-to-bottom.
 
