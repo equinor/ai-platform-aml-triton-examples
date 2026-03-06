@@ -168,57 +168,65 @@ Response:
 
 ## KServe Notebook
 
-`sklearn-triton-kserve-deployment.ipynb` · output: `sklearn-triton-kserve-deployment-output.ipynb`
+`sklearn-triton-kserve-deployment.ipynb` · output: [`sklearn-triton-kserve-deployment-output.ipynb`](sklearn-triton-kserve-deployment-output.ipynb)
 
-### What it does
-
-Deploys an already-registered Triton model to **KServe** running inside the same AKS cluster.
-No pipeline retraining, no AzureML Online Endpoint — the model is served by the native Triton
+Deploys an already-registered Triton model to **KServe** running inside the same AKS cluster —
+no pipeline retraining, no AzureML Online Endpoint. The model is served by the native Triton
 Inference Server via the KServe `InferenceService` CRD.
 
-| Step | Description |
-|------|-------------|
-| 1 | Fetch the latest `triton_model` from the AML model registry by name or prefix |
-| 2 | Blob-existence check to skip registrations that lack the required model subdirectory |
-| 3 | Download the model repository locally to verify layout and extract metadata |
-| 4 | Patch `config.pbtxt` (`max_batch_size: 0`, correct tensor dims) and re-upload to Azure Blob |
-| 5 | Resolve the `https://` blob storage URI that KServe will download from |
-| 6 | Retrieve the Azure storage account key via the Storage Management API |
-| 7 | Create a K8s `Secret` with blob credentials; patch `mlpipeline-minio-artifact` so the KServe storage initializer can authenticate |
-| 8 | Create a KServe `InferenceService` with `V1beta1TritonSpec` and `storageUri` pointing at the Triton model repository |
-| 9 | Poll until the `InferenceService` reaches `Ready = True` (10-minute timeout) |
-| 10 | Resolve cluster-internal ClusterIP service URL (external URL not reachable from inside the pod) |
-| 11 | Test the Triton endpoint with a KFServing V2 inference request |
-
-### Key differences from `train-on-ai-platform-aks-triton.ipynb`
+### vs. `train-on-ai-platform-aks-triton.ipynb`
 
 | | AzureML Endpoint notebook | KServe notebook |
 |-|--------------------------|-----------------|
 | **Serving runtime** | `score_ort.py` (sklearn + joblib) | Native Triton Inference Server |
 | **Deployment target** | AzureML `KubernetesOnlineEndpoint` | KServe `InferenceService` CRD |
 | **Retraining** | Full AML pipeline (train → analyse → batch-score) | None — fetches existing registered model |
-| **GPU required** | No (CPU-only via `score_ort.py`) | No (`KIND_CPU` in `config.pbtxt`) |
-| **Auth** | AML API key in `Authorization: Bearer` header | None by default (KServe cluster-internal) |
+| **Auth** | AML API key (`Authorization: Bearer`) | None (cluster-internal) |
+
+### Notebook sections
+
+#### Section 1 — Initial Setup & Configuration
+Install dependencies, set configuration variables, import libraries, and connect to the AML
+workspace via Managed Identity.
+
+#### Section 2 — Model Preparation
+
+| Step | Description |
+|------|-------------|
+| 2.1 | Fetch latest `triton_model` from AML registry by name/prefix; fast blob-existence check skips registrations without the required model subdirectory |
+| 2.2 | Download locally to verify Triton repository layout (`config.pbtxt`, `1/model.onnx`) and extract metadata |
+| 2.3 | Resolve `azureml://` path → `https://` blob URI for the Triton model repository root |
+| 2.4 | Retrieve Azure storage account key via Storage Management API (notebook pod has Managed Identity; storage initializer pod does not) |
+| 2.5 | Patch `config.pbtxt` (`max_batch_size: 0`, correct explicit tensor dims) and re-upload to Azure Blob |
+
+#### Section 3 — Inference Service Setup, Configuration & Deployment
+
+| Step | Description |
+|------|-------------|
+| 3.1 | Configure Kubernetes client (in-cluster config when running inside AKS; `az aks get-credentials` fallback) |
+| 3.2 | Create `azure-storage-secret` with blob credentials; patch `mlpipeline-minio-artifact.secretkey` with the real Azure key (required because the cluster's `ClusterStorageContainer` hardcodes this secret for `AZURE_STORAGE_ACCESS_KEY` injection) |
+| 3.3 | Create KServe `InferenceService` with `V1beta1TritonSpec` and `storageUri`; existing service is deleted first for a clean redeploy |
+| 3.4 | Poll until `InferenceService` reaches `Ready = True` (15-second interval, 10-minute timeout) |
+| 3.5 | Resolve cluster-internal ClusterIP service URL (external `status.url` is not DNS-resolvable from inside the pod) |
+
+#### Section 4 — Inference Service Testing
+Send a KFServing V2 inference request and verify the response. Cleanup cell restores
+`mlpipeline-minio-artifact.secretkey` to its original MinIO value.
 
 ### Inference API
 
-**Request** (identical to the AzureML endpoint):
+**Request:**
 ```json
 {
-  "inputs": [{
-    "name": "float_input",
-    "shape": [1, 4],
-    "datatype": "FP32",
-    "data": [[5.1, 3.5, 1.4, 0.2]]
-  }]
+  "inputs": [{"name": "float_input", "shape": [1, 4], "datatype": "FP32",
+              "data": [[5.1, 3.5, 1.4, 0.2]]}]
 }
 ```
 
 **Response:**
 ```json
 {
-  "model_name": "iris_classifier",
-  "model_version": "1",
+  "model_name": "iris_classifier", "model_version": "1",
   "outputs": [
     {"name": "label",         "shape": [1],    "datatype": "INT64", "data": [0]},
     {"name": "probabilities", "shape": [1, 3], "datatype": "FP32",  "data": [1.0, 0.0, 0.0]}
@@ -226,31 +234,15 @@ Inference Server via the KServe `InferenceService` CRD.
 }
 ```
 
+Class mapping: `0 = setosa`, `1 = versicolor`, `2 = virginica`
+
 ### Prerequisites
 
-- A `triton_model` already registered in the AML model registry containing an
-  `iris_classifier/` subdirectory with `config.pbtxt` and `1/model.onnx`
-  (created by running `train-on-ai-platform-aks-triton.ipynb` at least once)
-- KServe installed in the target AKS cluster (`kubectl get crds | grep inferenceservice`)
+- A `triton_model` registered in AML with an `iris_classifier/` subdirectory
+  (run `train-on-ai-platform-aks-triton.ipynb` once to create it)
+- KServe installed in the AKS cluster (`kubectl get crds | grep inferenceservice`)
 - Notebook running **inside** the AKS cluster (in-cluster K8s config)
-- Managed Identity on the notebook pod with `Storage Account Contributor` (or
-  `Microsoft.Storage/storageAccounts/listkeys/action`) on the AML storage account
-
-### Cluster-internal URL resolution
-
-KServe's `status.url` points to an external ingress hostname that is not
-DNS-resolvable from within the AKS cluster. The notebook automatically discovers
-the ClusterIP service created by Knative for the predictor revision:
-
-```python
-# Label selector used to find the ClusterIP service
-serving.knative.dev/service=iris-triton-predictor
-```
-
-The resulting URL has the form:
-```
-http://iris-triton-predictor-00001.unified.svc.cluster.local/v2/models/iris_classifier/infer
-```
+- Managed Identity with `Microsoft.Storage/storageAccounts/listkeys/action` on the AML storage account
 
 ---
 
