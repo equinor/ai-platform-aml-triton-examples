@@ -476,6 +476,46 @@ from and how the container image is delivered.
 
 ---
 
+### Background — How the notebook pod gets Azure credentials (Workload Identity)
+
+Before either secret pattern can work, the notebook itself needs to authenticate to Azure
+to fetch a storage key or exchange an ACR token. This is handled by **Azure Workload
+Identity**, which links a Kubernetes service account to a Managed Identity in Azure AD.
+
+```
+  Kubernetes                                          Azure AD
+  ──────────────────────────────────────────────────────────────────────────────────
+  ServiceAccount (notebook namespace)
+  ┌──────────────────────────────────────┐
+  │ name: <notebook-service-account>     │  annotation:
+  │ azure.workload.identity/client-id ───┼──────────────────────────────────────►
+  │   = <managed-identity-client-id>     │                     Managed Identity
+  └──────────────────────────────────────┘                     (in Azure AD)
+            │                                                         │
+            │  Workload Identity webhook                              │
+            │  intercepts pod creation                                │
+            ▼                                                         │
+  Notebook pod gets injected env vars:                                │
+    AZURE_CLIENT_ID     = <managed-identity-client-id>               │
+    AZURE_TENANT_ID     = <tenant>                                    │
+    AZURE_FEDERATED_TOKEN_FILE = /var/run/secrets/...token           │
+            │                                                         │
+            │  DefaultAzureCredential() picks up these vars           │
+            │  and presents the federated token to Azure AD           │
+            └────────────────────────────────────────────────────────►
+                                                  Azure AD validates the
+                                                  federation and issues
+                                                  an AAD access token
+                                                  back to the notebook pod
+```
+
+**Key point:** The notebook service account does not carry any Azure secrets itself — the
+credentials flow through the federated token mechanism. Only the resulting AAD access token
+(held in memory, never written to disk) is then used to fetch storage keys or exchange for
+ACR tokens that get written into Kubernetes Secrets.
+
+---
+
 ### Pattern 1 — Model Storage Secret (sklearn + PyTorch notebooks)
 
 **Used by:** `sklearn-triton-kserve-deployment.ipynb`, `pytorch-triton-kserve-deployment.ipynb`
@@ -549,6 +589,39 @@ initializer picks it up, then restores the original MinIO value in the cleanup c
                                         access Azure Blob
 ```
 
+**Service account role in Pattern 1**
+
+The notebook pod, the KServe controller, and the inference pod each run under their own
+service account. Only one of them actually reads the secret:
+
+```
+  Service Account               Runs                          Can read Secrets?
+  ──────────────────────────────────────────────────────────────────────────────
+  <notebook-sa>                 Notebook pod                  No (uses Workload
+                                                              Identity instead)
+
+  kserve-controller-manager     KServe controller pod         Yes — KServe installs
+                                (kserve namespace)            a ClusterRole granting
+                                                              get/list/watch on Secrets
+                                                              across all namespaces.
+                                                              This is how it reads the
+                                                              ClusterStorageContainer
+                                                              config and injects the
+                                                              secret into the storage
+                                                              initializer container.
+
+  default                       Inference pod                 No — the pod itself does
+                                (kserve namespace)            not read the secret. The
+                                                              KServe controller has
+                                                              already injected the key
+                                                              as an env var before the
+                                                              pod starts.
+```
+
+The notebook writes the secret; the KServe controller reads it and wires it into the pod;
+the pod sees it as an ordinary environment variable. The inference pod's service account
+never needs direct access to Azure or to Kubernetes Secrets.
+
 ---
 
 ### Pattern 2 — ACR Image Pull Secret (Python-custom notebook)
@@ -615,6 +688,41 @@ on the node, Kubernetes won't re-pull unless the pod is rescheduled to a differe
 the image is evicted. Re-running the notebook regenerates a fresh token before each
 deployment.
 
+**Service account role in Pattern 2**
+
+`imagePullSecrets` can be attached in two places — the pod spec or the service account.
+The notebooks use the pod spec approach (via `spec.predictor.imagePullSecrets` on the ISVC)
+because it is scoped to exactly one InferenceService:
+
+```
+  Option A — attach to the pod spec (what the notebooks do)
+  ─────────────────────────────────────────────────────────
+  InferenceService
+  └── spec.predictor.imagePullSecrets: [poly-regressor-triton-acr-pull]
+            │
+            └─► Knative copies this into the Pod spec when creating the revision.
+                Only pods for THIS InferenceService use the secret.
+                Other pods in the namespace are unaffected.
+
+
+  Option B — attach to the service account (alternative)
+  ──────────────────────────────────────────────────────
+  ServiceAccount: default  (in kserve namespace)
+  └── imagePullSecrets: [poly-regressor-triton-acr-pull]
+            │
+            └─► Every pod that runs under this service account
+                automatically gets the pull secret — including
+                ALL InferenceServices in the namespace.
+                Simpler to manage, but broader than necessary.
+
+  kubectl patch serviceaccount default \
+    -n <kserve-namespace> \
+    -p '{"imagePullSecrets": [{"name": "poly-regressor-triton-acr-pull"}]}'
+```
+
+The notebooks use Option A so that the secret binding is visible in the ISVC definition
+and does not silently affect other services in the namespace.
+
 ---
 
 ### Side-by-side comparison
@@ -631,27 +739,86 @@ deployment.
 
 ---
 
+### Service accounts involved across both patterns
+
+Three service accounts play a role. None of them is the same account.
+
+```
+  ┌─────────────────────────────────────────────────────────────────────────────┐
+  │                        AKS Cluster                                          │
+  │                                                                             │
+  │  Namespace: <notebook-ns>          Namespace: kserve                        │
+  │  ┌─────────────────────────┐       ┌─────────────────────────────────────┐  │
+  │  │ ServiceAccount          │       │ ServiceAccount                      │  │
+  │  │ <notebook-sa>           │       │ kserve-controller-manager           │  │
+  │  │                         │       │                                     │  │
+  │  │ annotation:             │       │ ClusterRole (installed by KServe):  │  │
+  │  │  azure.workload.        │       │  get/list/watch Secrets (all ns)    │  │
+  │  │  identity/client-id     │       │  get/list/watch InferenceServices   │  │
+  │  │                         │       │  create/patch Pods, Services, ...   │  │
+  │  │ What it does:           │       │                                     │  │
+  │  │  Lets the notebook pod  │       │ What it does:                       │  │
+  │  │  call Azure APIs via    │       │  Watches for new/changed ISVCs,     │  │
+  │  │  Workload Identity       │       │  reads ClusterStorageContainer,     │  │
+  │  │  (no Azure secret        │       │  injects storage secrets into       │  │
+  │  │  stored in K8s)          │       │  the storage initializer container  │  │
+  │  └─────────────────────────┘       └─────────────────────────────────────┘  │
+  │                                                                             │
+  │  Namespace: kserve  (inference pods)                                        │
+  │  ┌──────────────────────────────────────────────────────────────────────┐   │
+  │  │ ServiceAccount: default                                              │   │
+  │  │                                                                      │   │
+  │  │ What it does:                                                        │   │
+  │  │  All inference pods run under this account by default.              │   │
+  │  │  It has no special permissions — Azure storage access comes from    │   │
+  │  │  the injected env var (Pattern 1), and image pull credentials        │   │
+  │  │  come from the pod-spec imagePullSecrets (Pattern 2).               │   │
+  │  │                                                                      │   │
+  │  │  Optional: attach imagePullSecrets here to avoid per-ISVC           │   │
+  │  │  configuration (see Option B in Pattern 2 above).                   │   │
+  │  └──────────────────────────────────────────────────────────────────────┘   │
+  └─────────────────────────────────────────────────────────────────────────────┘
+```
+
+| Service Account | Namespace | Purpose | Needs Azure access? |
+|-----------------|-----------|---------|---------------------|
+| `<notebook-sa>` | notebook namespace | Runs notebook pod; gets AAD tokens via Workload Identity to fetch storage keys and ACR tokens | Via Workload Identity (no K8s secret) |
+| `kserve-controller-manager` | `kserve` | KServe controller; reads secrets and wires them into inference pod specs | No Azure access needed — only reads K8s Secrets |
+| `default` | `kserve` (inference) | Runs inference pods (Triton, storage initializer); receives secrets as env vars or pull configs, never reads them directly | No |
+
+---
+
 ### Where secrets appear in the pod lifecycle
 
 ```
-  ┌────────────────────────────────────────────────────────────────┐
-  │                   InferenceService Pod                         │
-  │                                                                │
-  │  ┌──────────────────────────────┐  ┌────────────────────────┐ │
-  │  │  Storage Initializer         │  │  Triton Server         │ │
-  │  │  (init container, runs first)│  │  (main container)      │ │
-  │  │                              │  │                        │ │
-  │  │  Reads: azure-storage-secret │  │  Reads: model files    │ │
-  │  │  Downloads model from Blob   │  │  from /mnt/models/     │ │
-  │  │  → writes to /mnt/models/    │  │  (mounted volume)      │ │
-  │  └──────────────────────────────┘  └────────────────────────┘ │
-  │                                                                │
-  │  Image pulled using: imagePullSecret  ◄── ACR pull secret     │
-  │  (happens before pod starts, at the node/kubelet level)       │
-  └────────────────────────────────────────────────────────────────┘
+                ┌─ kserve-controller-manager (service account) ──────────────────┐
+                │  reads ClusterStorageContainer, injects secret into pod spec    │
+                └────────────────────────────────┬───────────────────────────────┘
+                                                 │ creates pod
+                                                 ▼
+  ┌──────────────────────────────────────────────────────────────────────────────┐
+  │  InferenceService Pod    (service account: default)                          │
+  │                                                                              │
+  │  ── image pull happens here, before any container starts ──────────────────  │
+  │  │  kubelet checks pod spec imagePullSecrets (Pattern 2)                  │  │
+  │  │  or node's pre-granted ACR role; presents credentials to ACR           │  │
+  │  └─────────────────────────────────────────────────────────────────────────  │
+  │                                                                              │
+  │  ┌───────────────────────────────┐  ┌──────────────────────────────────┐    │
+  │  │  Storage Initializer          │  │  Triton Server                   │    │
+  │  │  (init container, runs first) │  │  (main container)                │    │
+  │  │                               │  │                                  │    │
+  │  │  env: AZURE_STORAGE_ACCESS_   │  │  Reads model files               │    │
+  │  │  KEY injected from secret     │  │  from /mnt/models/ (Pattern 1)   │    │
+  │  │  by KServe controller         │  │  or from image layers (Pattern 2) │    │
+  │  │  (Pattern 1 only)             │  │                                  │    │
+  │  │  → downloads model            │  │  serviceAccount: default         │    │
+  │  │  → writes to /mnt/models/     │  │  (no Azure access needed)        │    │
+  │  └───────────────────────────────┘  └──────────────────────────────────┘    │
+  └──────────────────────────────────────────────────────────────────────────────┘
 
-  Pattern 1 (model from Blob):   storage secret ──► storage initializer ──► /mnt/models/
-  Pattern 2 (model in image):    pull secret ──► kubelet ──► image layers cached on node
+  Pattern 1 (model from Blob):   storage secret ──► KServe controller ──► env var ──► storage initializer ──► /mnt/models/
+  Pattern 2 (model in image):    pull secret ──► pod spec imagePullSecrets ──► kubelet ──► image layers on node
 ```
 
 ---
