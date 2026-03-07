@@ -1,0 +1,1275 @@
+"""Generate python-custom-triton-kserve-deployment.ipynb using nbformat."""
+import nbformat
+from nbformat.v4 import new_notebook, new_markdown_cell, new_code_cell
+
+C = new_code_cell
+M = new_markdown_cell
+cells = []
+
+# ── Title ─────────────────────────────────────────────────────────────────────
+cells.append(M(
+    "# Deploy Custom Python Backend Model to KServe with Triton Inference Server\n"
+    "\n"
+    "Trains a **custom polynomial ridge regression model** entirely in pure NumPy (no standard ML\n"
+    "framework), packages it as a **Triton Python backend**, bakes it into a **Docker image** pushed\n"
+    "to the **Azure Container Registry (ACR)** associated with the AML workspace, and deploys it to\n"
+    "**KServe** using a custom container — no AzureML Online Endpoint, no blob storage initializer.\n"
+    "\n"
+    "| Section | What happens |\n"
+    "|---------|-------------|\n"
+    "| **1 · Initial Setup & Configuration** | Install packages, set variables, connect to AML workspace |\n"
+    "| **2 · Model Training & Image Build** | Train model locally, write Triton Python backend, build & push Docker image to ACR |\n"
+    "| **3 · Inference Service Setup & Deployment** | Configure K8s client, deploy KServe `InferenceService` with custom container, wait for Ready |\n"
+    "| **4 · Inference Service Testing** | Send KFServing V2 inference requests and verify predictions |\n"
+    "\n"
+    "**Key difference from the sklearn/pytorch notebooks:** the model is **baked into the Docker\n"
+    "image** rather than downloaded at pod startup by the KServe storage initializer. There is no\n"
+    "`storageUri` and no Azure Blob credential secret required.\n"
+))
+
+# ── Section 1 ─────────────────────────────────────────────────────────────────
+cells.append(M(
+    "---\n"
+    "## Section 1 — Initial Setup & Configuration\n"
+    "\n"
+    "Install dependencies, set all configuration variables, import libraries, and connect to the\n"
+    "Azure ML workspace. **Run these cells once per kernel restart.**\n"
+))
+
+cells.append(M(
+    "### 1.1 · Install Required Packages\n"
+    "\n"
+    "Installs KServe, Kubernetes, and Azure management SDKs.\n"
+    "`azure-mgmt-containerregistry` is installed `--user` to avoid conflicts with read-only system\n"
+    "packages; it provides the **ACR Tasks** API used in Section 2 to build the Docker image\n"
+    "inside Azure — no local Docker daemon required.\n"
+))
+
+cells.append(C(
+    '%pip install "azure-ai-ml>=1.12.0" \\\n'
+    '             "azure-identity>=1.14.0" \\\n'
+    '             "numpy>=1.24.0" \\\n'
+    '             "requests>=2.31.0" \\\n'
+    '             "kubernetes>=28.1.0" \\\n'
+    '             "kserve>=0.12.0" \\\n'
+    '             "azure-storage-blob>=12.19.0"\n'
+    "# Install management SDKs to user site-packages (avoid system package conflicts)\n"
+    '%pip install "azure-mgmt-storage>=21.0.0" \\\n'
+    '             "azure-mgmt-containerregistry>=10.0.0" \\\n'
+    "             --user -q\n"
+))
+
+cells.append(C(
+    "# ── Project Root Setup ────────────────────────────────────────────────────────\n"
+    "import os, sys\n"
+    "from pathlib import Path\n"
+    "\n"
+    "_nb_file = globals().get('__vsc_ipynb_file__') or globals().get('__file__', None)\n"
+    "if _nb_file:\n"
+    "    _project_root = str(Path(_nb_file).resolve().parent)\n"
+    "    os.chdir(_project_root)\n"
+    "else:\n"
+    "    _project_root = os.getcwd()\n"
+    "\n"
+    "if _project_root not in sys.path:\n"
+    "    sys.path.insert(0, _project_root)\n"
+    "\n"
+    "os.makedirs(os.path.join(_project_root, 'artifacts'), exist_ok=True)\n"
+    "\n"
+    "print(f'Project root : {_project_root}')\n"
+    "print(f'Working dir  : {os.getcwd()}')\n"
+))
+
+cells.append(M(
+    "### 1.2 · Available Compute Targets (reference)\n"
+    "\n"
+    "| Compute Name | Time Slicing Options | Base Node Guaranteed CPU | Base Node Guaranteed Memory |\n"
+    "|--------------|---------------------|--------------------------|------------------------------|\n"
+    "| cpu          | -2, -4              | 14                       | 46Gi                         |\n"
+    "| gput41       | -2, -4              | 6                        | 44Gi                         |\n"
+    "| gpuv1001     | -2, -4              | 4                        | 98Gi                         |\n"
+    "| gpuv1002     | -2, -4              | 10                       | 206Gi                        |\n"
+    "| gpua100      | -2, -4              | 22                       | 202Gi                        |\n"
+    "| gput44       | -2, -4, -8          | 56                       | 410Gi                        |\n"
+    "| gpuv1004     | -2, -4, -8          | 22                       | 422Gi                        |\n"
+    "\n"
+    "> This notebook uses `KIND_CPU` — no GPU is required. Use `cpu-2` or `cpu-4`.\n"
+))
+
+cells.append(M(
+    "### 1.3 · Configuration\n"
+    "\n"
+    "Set all deployment parameters here before running the notebook.\n"
+    "\n"
+    "| Variable | Purpose |\n"
+    "|----------|---------|\n"
+    "| `triton_model_name` | Name of the Triton model (also used as the directory name under `/models`) |\n"
+    "| `inference_service_name` | Name of the KServe `InferenceService` resource to create |\n"
+    "| `kserve_namespace` | Kubernetes namespace where KServe CRDs are installed |\n"
+    "| `image_name` | Docker image name (without registry prefix or tag) |\n"
+    "| `image_version` | Docker image tag |\n"
+    "| `polynomial_degree` | Degree of the polynomial feature expansion used by the regression model |\n"
+    "| `request_cpu` / `request_ram` | CPU and memory resource requests for the predictor pod |\n"
+    "| `limit_cpu` / `limit_ram` | CPU and memory resource limits for the predictor pod |\n"
+))
+
+cells.append(C(
+    "# ── KServe deployment settings ────────────────────────────────────────────────\n"
+    "triton_model_name      = 'poly_regressor'\n"
+    "inference_service_name = 'poly-regressor-triton'\n"
+    "kserve_namespace       = 'unified'\n"
+    "acr_pull_secret_name   = 'poly-regressor-triton-acr-pull'  # K8s docker-registry secret\n"
+    "\n"
+    "# ── Docker image settings ──────────────────────────────────────────────────────\n"
+    "# Image will be pushed to: <acr_login_server>/<image_name>:<image_version>\n"
+    "image_name    = 'poly-regressor-triton'\n"
+    "image_version = 'v3'\n"
+    "\n"
+    "# ── Model hyperparameters ─────────────────────────────────────────────────────\n"
+    "# Degree of polynomial feature expansion.\n"
+    "# Degree 13 gives RMSE < 0.03 over [-pi, pi] while all test cases pass (|err| < 0.05).\n"
+    "polynomial_degree = 13\n"
+    "\n"
+    "# ── Resource requests / limits for the predictor pod ─────────────────────────\n"
+    "request_cpu = '500m'\n"
+    "request_ram = '2Gi'\n"
+    "limit_cpu   = '2'\n"
+    "limit_ram   = '4Gi'\n"
+    "\n"
+    "tags = {\n"
+    "    'Purpose':   'Project Resources',\n"
+    "    'by_person': 'by_person',\n"
+    "}\n"
+))
+
+cells.append(M(
+    "### 1.4 · Imports & Workspace Connection\n"
+    "\n"
+    "Imports all required libraries and connects to the Azure ML workspace using the pod's\n"
+    "**Managed Identity** (`AZURE_CLIENT_ID`). Workspace metadata is read from the Kubernetes\n"
+    "ConfigMap via `load_tags`.\n"
+    "\n"
+    "Additional imports:\n"
+    "- `azure-mgmt-containerregistry` — ACR Tasks API for cloud-side Docker build\n"
+    "- `azure-mgmt-storage` — retrieve Azure storage account key for uploading the build context\n"
+))
+
+cells.append(C(
+    "import os, re, json, tarfile, datetime, time, shutil\n"
+    "from pathlib import Path\n"
+    "\n"
+    "# azure-mgmt-* packages installed --user; add user site-packages to sys.path\n"
+    "import sys\n"
+    "_user_site = os.path.expanduser('~/.local/lib/python3.11/site-packages')\n"
+    "if _user_site not in sys.path:\n"
+    "    sys.path.insert(0, _user_site)\n"
+    "\n"
+    "import numpy as np\n"
+    "\n"
+    "from azure.ai.ml import MLClient\n"
+    "from azure.identity import ManagedIdentityCredential\n"
+    "from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions\n"
+    "\n"
+    "from kubernetes import client as k8s_client, config as k8s_config\n"
+    "from kserve import (\n"
+    "    KServeClient,\n"
+    "    V1beta1InferenceService,\n"
+    "    V1beta1InferenceServiceSpec,\n"
+    "    V1beta1PredictorSpec,\n"
+    "    constants,\n"
+    ")\n"
+    "\n"
+    "# Service identity\n"
+    "nb_prefix              = os.getenv('NB_PREFIX', '/notebook/unknown/unknown')\n"
+    "_, namespace, pod_name = nb_prefix.strip('/').split('/')\n"
+    "AZURE_CLIENT_ID        = os.getenv('AZURE_CLIENT_ID')\n"
+    "credential             = ManagedIdentityCredential(client_id=AZURE_CLIENT_ID)\n"
+))
+
+cells.append(C(
+    "from src._helpers.load_tags import load_tags\n"
+    "tags = load_tags(tags={}, namespace=namespace, pod_name=pod_name)\n"
+    "for k, v in tags.items():\n"
+    "    globals()[k] = v\n"
+    "\n"
+    "print(tags)\n"
+))
+
+cells.append(C(
+    "subscription_id = subscription_id\n"
+    "resource_group  = aml_workspace_rg\n"
+    "workspace       = aml_workspace\n"
+    "\n"
+    "ml_client = MLClient(credential, subscription_id, resource_group, workspace)\n"
+    "print(f'ML Client workspace: {ml_client.workspace_name}')\n"
+))
+
+cells.append(M(
+    "### 1.5 · Resolve AML Workspace Storage & ACR\n"
+    "\n"
+    "Retrieves:\n"
+    "- **Azure Blob Storage** account/container from the AML workspace's default datastore\n"
+    "  _(used to upload the Docker build context for ACR Tasks)_\n"
+    "- **Azure Container Registry** name and resource group from the workspace metadata\n"
+    "  _(the ACR Tasks build will push the image here)_\n"
+    "- **Storage account key** via the Azure Storage Management API\n"
+    "  _(needed to upload the build context tar.gz and to generate the SAS URL for ACR Tasks)_\n"
+))
+
+cells.append(C(
+    "# ── Default datastore (for build context upload) ──────────────────────────────\n"
+    "default_ds      = ml_client.datastores.get_default()\n"
+    "storage_account = default_ds.account_name\n"
+    "container_name  = default_ds.container_name\n"
+    "print(f'Default datastore : {default_ds.name}')\n"
+    "print(f'Storage account   : {storage_account}')\n"
+    "print(f'Container         : {container_name}')\n"
+    "\n"
+    "# ── ACR from workspace ────────────────────────────────────────────────────────\n"
+    "workspace_obj   = ml_client.workspaces.get(workspace)\n"
+    "acr_resource_id = workspace_obj.container_registry\n"
+    "\n"
+    "# Parse /subscriptions/.../resourceGroups/<rg>/providers/.../registries/<name>\n"
+    "_acr_parts         = acr_resource_id.split('/')\n"
+    "acr_resource_group = _acr_parts[_acr_parts.index('resourceGroups') + 1]\n"
+    "acr_name           = _acr_parts[-1]\n"
+    "print(f'\\nWorkspace ACR     : {acr_name}')\n"
+    "print(f'ACR resource group: {acr_resource_group}')\n"
+    "\n"
+    "# ── Storage account key ───────────────────────────────────────────────────────\n"
+    "storage_account_key = None\n"
+    "\n"
+    "# Method 1: from AML datastore credentials\n"
+    "try:\n"
+    "    ds_creds = default_ds.credentials\n"
+    "    if hasattr(ds_creds, 'account_key') and ds_creds.account_key:\n"
+    "        storage_account_key = ds_creds.account_key\n"
+    "        print('\\nStorage key: retrieved from AML datastore credentials.')\n"
+    "except Exception:\n"
+    "    pass\n"
+    "\n"
+    "# Method 2: Azure Storage Management API\n"
+    "if not storage_account_key:\n"
+    "    try:\n"
+    "        from azure.mgmt.storage import StorageManagementClient\n"
+    "        storage_mgmt = StorageManagementClient(credential, subscription_id)\n"
+    "        keys = storage_mgmt.storage_accounts.list_keys(resource_group, storage_account)\n"
+    "        storage_account_key = keys.keys[0].value\n"
+    "        print('\\nStorage key: retrieved via Azure Storage Management API.')\n"
+    "    except Exception as e:\n"
+    "        print(f'\\nWARNING: Could not retrieve storage key: {e}')\n"
+    "\n"
+    "if storage_account_key:\n"
+    "    print(f'Storage key length: {len(storage_account_key)}')\n"
+    "else:\n"
+    "    raise RuntimeError(\n"
+    "        'Could not retrieve storage account key. '\n"
+    "        'Ensure the managed identity has Storage Account Contributor on the storage account.'\n"
+    "    )\n"
+))
+
+# ── Section 2 ─────────────────────────────────────────────────────────────────
+cells.append(M(
+    "---\n"
+    "## Section 2 — Model Training & Docker Image Build\n"
+    "\n"
+    "Train the custom model locally, write the Triton Python backend files, build a Docker image\n"
+    "containing the model, and push it to the workspace ACR.\n"
+    "\n"
+    "**Custom model:** degree-9 polynomial ridge regression  \n"
+    "**Target function:** `y = sin(x) + 0.5*sin(3x)` (sum of two harmonics, non-trivial shape)  \n"
+    "**Implementation:** pure NumPy closed-form solution — no scikit-learn, PyTorch, or TensorFlow\n"
+    "\n"
+    "```\n"
+    "artifacts/\n"
+    "  poly_model_repo/\n"
+    "    poly_regressor/\n"
+    "      config.pbtxt          <- Triton Python backend config\n"
+    "      1/\n"
+    "        model.py            <- TritonPythonModel class (Python backend entry point)\n"
+    "        weights.npz         <- NumPy arrays: coef (n+1,) and degree (scalar)\n"
+    "  docker_build_context/\n"
+    "    Dockerfile              <- FROM tritonserver:23.08-py3, COPY model_repo /models\n"
+    "    model_repo/             <- copy of poly_model_repo/\n"
+    "```\n"
+))
+
+cells.append(M(
+    "### 2.1 · Train Polynomial Ridge Regression Model\n"
+    "\n"
+    "Fits a degree-9 polynomial to the target `y = sin(x) + 0.5*sin(3x)` over `[-pi, pi]`\n"
+    "using the **closed-form ridge solution**:\n"
+    "\n"
+    "```\n"
+    "w = (X^T X + alpha*I)^{-1} X^T y\n"
+    "```\n"
+    "\n"
+    "where `X` is the Vandermonde matrix `[1, x, x^2, ..., x^9]` and `alpha = 1e-3`.\n"
+    "\n"
+    "This is intentionally implemented in **plain NumPy** — no sklearn, no framework —\n"
+    "demonstrating that any arbitrary Python algorithm can be served via the Triton Python backend.\n"
+))
+
+cells.append(C(
+    "# ── Hyperparameters ───────────────────────────────────────────────────────────\n"
+    "degree  = polynomial_degree   # from configuration cell\n"
+    "alpha   = 1e-8                # ridge regularisation strength (small: near-exact fit)\n"
+    "x_scale = np.pi               # normalise x to [-1, 1] for numerical stability\n"
+    "n_train = 500\n"
+    "\n"
+    "# ── Training data ─────────────────────────────────────────────────────────────\n"
+    "rng     = np.random.default_rng(42)\n"
+    "x_train = np.linspace(-np.pi, np.pi, n_train)\n"
+    "y_train = np.sin(x_train) + 0.5 * np.sin(3 * x_train) + rng.normal(0, 0.02, n_train)\n"
+    "\n"
+    "# ── Polynomial features (normalised Vandermonde matrix) ───────────────────────\n"
+    "# Normalising x to [-1, 1] prevents x^13 from reaching ~10^6, which would make\n"
+    "# the normal equations ill-conditioned even with ridge regularisation.\n"
+    "def poly_features(x, deg, scale=1.0):\n"
+    "    x_norm = x.ravel() / scale\n"
+    "    return np.column_stack([x_norm ** i for i in range(deg + 1)])\n"
+    "\n"
+    "X_train = poly_features(x_train, degree, x_scale)\n"
+    "\n"
+    "# ── Closed-form ridge regression ──────────────────────────────────────────────\n"
+    "XTX  = X_train.T @ X_train\n"
+    "XTy  = X_train.T @ y_train\n"
+    "coef = np.linalg.solve(XTX + alpha * np.eye(degree + 1), XTy)\n"
+    "\n"
+    "# ── Evaluate on a held-out grid ───────────────────────────────────────────────\n"
+    "x_eval = np.linspace(-np.pi, np.pi, 200)\n"
+    "y_true = np.sin(x_eval) + 0.5 * np.sin(3 * x_eval)\n"
+    "X_eval = poly_features(x_eval, degree, x_scale)\n"
+    "y_pred = X_eval @ coef\n"
+    "rmse   = np.sqrt(np.mean((y_pred - y_true) ** 2))\n"
+    "\n"
+    "print(f'Model trained  — degree={degree}, ridge alpha={alpha}, x_scale={x_scale:.4f}')\n"
+    "print(f'Evaluation RMSE: {rmse:.6f}')\n"
+    "print(f'Coefficient shape: {coef.shape}')\n"
+    "\n"
+    "# ── Quick sanity check ────────────────────────────────────────────────────────\n"
+    "x_chk = np.array([0.0, np.pi / 2, np.pi])\n"
+    "y_chk = np.sin(x_chk) + 0.5 * np.sin(3 * x_chk)\n"
+    "y_hat = poly_features(x_chk, degree, x_scale) @ coef\n"
+    "print('\\nSanity check:')\n"
+    "for xv, yv, yh in zip(x_chk, y_chk, y_hat):\n"
+    "    err = abs(yh - yv)\n"
+    "    ok  = 'v' if err < 0.05 else 'x'\n"
+    "    print(f'  {ok}  x={xv:+.4f}  true={yv:+.4f}  pred={yh:+.4f}  |err|={err:.6f}')\n"
+))
+
+cells.append(M(
+    "### 2.2 · Prepare Triton Model Repository\n"
+    "\n"
+    "Creates the Triton model repository layout on disk:\n"
+    "\n"
+    "```\n"
+    "poly_model_repo/\n"
+    "  poly_regressor/\n"
+    "    config.pbtxt      <- backend: python, input x [FP32,-1,1], output y [FP32,-1,1]\n"
+    "    1/\n"
+    "      model.py        <- TritonPythonModel: load weights, run poly regression\n"
+    "      weights.npz     <- {coef: array(10,), degree: array(0-d)}\n"
+    "```\n"
+    "\n"
+    "The `model.py` file uses `triton_python_backend_utils` — a module only available inside\n"
+    "the Triton container. It is **not imported** here; it is only written to disk.\n"
+))
+
+# Build model.py and config.pbtxt content via line-lists to avoid triple-quote issues
+_model_py_lines = [
+    "import triton_python_backend_utils as pb_utils",
+    "import numpy as np",
+    "import os",
+    "",
+    "",
+    "class TritonPythonModel:",
+    "    # Degree-n polynomial ridge regression served via the Triton Python backend.",
+    "    #",
+    "    # Input:  x -- FP32 tensor, shape [-1, 1] (one scalar x per row)",
+    "    # Output: y -- FP32 tensor, shape [-1, 1] (predicted y = sin(x) + 0.5*sin(3x))",
+    "",
+    "    def initialize(self, args):",
+    "        # Load polynomial coefficients from weights.npz",
+    "        model_dir    = os.path.join(args['model_repository'], args['model_version'])",
+    "        weights_path = os.path.join(model_dir, 'weights.npz')",
+    "        params       = np.load(weights_path)",
+    "        self.coef    = params['coef'].astype(np.float64)  # shape (degree+1,)",
+    "        self.degree  = int(params['degree'])",
+    "        self.x_scale = float(params['x_scale'])  # normalisation factor (x divided by this before poly expansion)",
+    "        print(f'[poly_regressor] Loaded weights: degree={self.degree}, x_scale={self.x_scale}')",
+    "",
+    "    def execute(self, requests):",
+    "        # Run polynomial regression for each request in the batch",
+    "        responses = []",
+    "        for request in requests:",
+    "            # Input: x -- FP32, shape [N, 1]",
+    "            x = pb_utils.get_input_tensor_by_name(request, 'x').as_numpy().astype(np.float64)",
+    "            # Normalise x the same way as during training, then build Vandermonde matrix",
+    "            x_norm = x / self.x_scale  # normalise to [-1, 1]",
+    "            X = np.column_stack([x_norm.ravel() ** i for i in range(self.degree + 1)])",
+    "            # Apply linear model and reshape to [N, 1]",
+    "            y = (X @ self.coef).reshape(-1, 1).astype(np.float32)",
+    "            out_tensor = pb_utils.Tensor('y', y)",
+    "            responses.append(pb_utils.InferenceResponse(output_tensors=[out_tensor]))",
+    "        return responses",
+    "",
+    "    def finalize(self):",
+    "        pass",
+]
+
+_config_lines = [
+    'name: "poly_regressor"',
+    'backend: "python"',
+    "max_batch_size: 0",
+    "",
+    "# max_batch_size: 0 means the batch dimension is explicit in dims.",
+    "# Both input and output are [N, 1] where N is the number of inference requests.",
+    "",
+    "input [",
+    "  {",
+    '    name:      "x"',
+    "    data_type: TYPE_FP32",
+    "    dims:      [-1, 1]",
+    "  }",
+    "]",
+    "",
+    "output [",
+    "  {",
+    '    name:      "y"',
+    "    data_type: TYPE_FP32",
+    "    dims:      [-1, 1]",
+    "  }",
+    "]",
+    "",
+    "instance_group [",
+    "  {",
+    "    kind:  KIND_CPU",
+    "    count: 1",
+    "  }",
+    "]",
+]
+
+_model_py_repr   = repr("\n".join(_model_py_lines) + "\n")
+_config_txt_repr = repr("\n".join(_config_lines) + "\n")
+
+cells.append(C(
+    "# ── Model repository paths ────────────────────────────────────────────────────\n"
+    "model_repo_dir = Path(_project_root) / 'artifacts' / 'poly_model_repo'\n"
+    "model_dir      = model_repo_dir / triton_model_name\n"
+    "version_dir    = model_dir / '1'\n"
+    "version_dir.mkdir(parents=True, exist_ok=True)\n"
+    "print(f'Model repository: {model_repo_dir}')\n"
+    "\n"
+    "# ── Save model weights ────────────────────────────────────────────────────────\n"
+    "weights_path = version_dir / 'weights.npz'\n"
+    "np.savez(str(weights_path), coef=coef, degree=np.array(degree), x_scale=np.array(x_scale))\n"
+    "print(f'Saved weights    : {weights_path}  ({weights_path.stat().st_size} bytes)')\n"
+    "\n"
+    "# ── Write model.py (Triton Python backend) ────────────────────────────────────\n"
+    "# Content uses single-quotes to avoid any triple-quote sequences.\n"
+    f"model_py_content = {_model_py_repr}\n"
+    "model_py_path = version_dir / 'model.py'\n"
+    "model_py_path.write_text(model_py_content)\n"
+    "print(f'Wrote model.py   : {model_py_path}')\n"
+    "\n"
+    "# ── Write config.pbtxt (Triton Python backend config) ─────────────────────────\n"
+    f"config_txt = {_config_txt_repr}\n"
+    "config_path = model_dir / 'config.pbtxt'\n"
+    "config_path.write_text(config_txt)\n"
+    "print(f'Wrote config.pbtxt: {config_path}')\n"
+    "print()\n"
+    "print('config.pbtxt:')\n"
+    "print(config_txt)\n"
+    "print('Model repository layout:')\n"
+    "for p in sorted(model_repo_dir.rglob('*')):\n"
+    "    if p.is_file():\n"
+    "        print(f'  {p.relative_to(model_repo_dir)}  ({p.stat().st_size} bytes)')\n"
+))
+
+cells.append(M(
+    "### 2.3 · Build Docker Image Context\n"
+    "\n"
+    "Creates a `Dockerfile` that:\n"
+    "1. Starts from the **Triton Inference Server 23.08** base image\n"
+    "2. Copies the model repository into `/models` inside the image\n"
+    "3. Exposes Triton ports (HTTP 8000, gRPC 8001, metrics 8002)\n"
+    "\n"
+    "The build context is packaged as a **tar.gz** — the format expected by ACR Tasks when\n"
+    "`source_location` is a remote blob SAS URL.\n"
+))
+
+cells.append(C(
+    "import shutil\n"
+    "\n"
+    "# ── Build context directory ───────────────────────────────────────────────────\n"
+    "build_ctx_dir = Path(_project_root) / 'artifacts' / 'docker_build_context'\n"
+    "if build_ctx_dir.exists():\n"
+    "    shutil.rmtree(build_ctx_dir)\n"
+    "build_ctx_dir.mkdir(parents=True, exist_ok=True)\n"
+    "\n"
+    "# ── Dockerfile ────────────────────────────────────────────────────────────────\n"
+    "# The tritonserver 23.08-py3 image includes:\n"
+    "#   - Python 3.8 + triton_python_backend_utils module\n"
+    "#   - ONNX Runtime, Python backend, and other standard backends\n"
+    "#   - ENTRYPOINT: /opt/tritonserver/bin/tritonserver\n"
+    "# KIND_CPU in config.pbtxt means no GPU driver is required on the AKS node.\n"
+    "dockerfile_lines = [\n"
+    "    'FROM nvcr.io/nvidia/tritonserver:23.08-py3',\n"
+    "    '',\n"
+    "    '# Copy the Triton model repository containing our Python backend model',\n"
+    "    'COPY model_repo /models',\n"
+    "    '',\n"
+    "    '# Triton HTTP (8080), gRPC (9000), and metrics (8002) ports',\n"
+    "    '# Port 8080 matches Knative Serving default user-port, avoiding H2C probe issues.',\n"
+    "    'EXPOSE 8080 9000 8002',\n"
+    "    '',\n"
+    "    '# Override the NVIDIA wrapper entrypoint and run tritonserver directly.',\n"
+    "    '# This avoids nvidia_entrypoint.sh exec argument handling issues on CPU nodes.',\n"
+    "    'ENTRYPOINT [\"/opt/tritonserver/bin/tritonserver\"]',\n"
+    "    f'CMD [\"--model-repository=/models\", \"--model-control-mode=explicit\", \"--load-model={triton_model_name}\", \"--http-port=8080\", \"--grpc-port=9000\"]',\n"
+    "]\n"
+    "dockerfile_content = '\\n'.join(dockerfile_lines) + '\\n'\n"
+    "(build_ctx_dir / 'Dockerfile').write_text(dockerfile_content)\n"
+    "print('Wrote Dockerfile:')\n"
+    "print(dockerfile_content)\n"
+    "\n"
+    "# ── Copy model_repo into build context ───────────────────────────────────────\n"
+    "dst_model_repo = build_ctx_dir / 'model_repo'\n"
+    "if dst_model_repo.exists():\n"
+    "    shutil.rmtree(dst_model_repo)\n"
+    "shutil.copytree(str(model_repo_dir), str(dst_model_repo))\n"
+    "print('Copied model_repo into build context.')\n"
+    "\n"
+    "# ── Create tar.gz build context ───────────────────────────────────────────────\n"
+    "tar_path = Path(_project_root) / 'artifacts' / 'docker_build_context.tar.gz'\n"
+    "with tarfile.open(str(tar_path), 'w:gz') as tar:\n"
+    "    tar.add(str(build_ctx_dir), arcname='.')\n"
+    "\n"
+    "print('Build context layout:')\n"
+    "for p in sorted(build_ctx_dir.rglob('*')):\n"
+    "    if p.is_file():\n"
+    "        print(f'  {p.relative_to(build_ctx_dir)}  ({p.stat().st_size} bytes)')\n"
+    "print(f'\\nBuild context tar.gz: {tar_path}  ({tar_path.stat().st_size:,} bytes)')\n"
+))
+
+cells.append(M(
+    "### 2.4 · Upload Build Context to Azure Blob Storage\n"
+    "\n"
+    "Uploads `docker_build_context.tar.gz` to the AML workspace's default datastore and\n"
+    "generates a **SAS URL** valid for 2 hours. ACR Tasks uses this SAS URL as the build context\n"
+    "source — it downloads the archive, extracts it, and runs `docker build` inside Azure.\n"
+    "\n"
+    "This eliminates the need for a local Docker daemon or any Docker CLI tools.\n"
+))
+
+cells.append(C(
+    "# ── Upload tar.gz to blob storage ─────────────────────────────────────────────\n"
+    "blob_service = BlobServiceClient(\n"
+    "    account_url=f'https://{storage_account}.blob.core.windows.net',\n"
+    "    credential=credential,\n"
+    ")\n"
+    "container_client = blob_service.get_container_client(container_name)\n"
+    "\n"
+    "_ts       = datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S')\n"
+    "blob_name = f'build-contexts/{image_name}-{_ts}.tar.gz'\n"
+    "\n"
+    "print(f'Uploading build context to blob://{storage_account}/{container_name}/{blob_name} ...')\n"
+    "with open(str(tar_path), 'rb') as f:\n"
+    "    container_client.upload_blob(blob_name, f, overwrite=True)\n"
+    "print('Upload complete.')\n"
+    "\n"
+    "# ── Generate SAS URL (read, 2-hour expiry) ────────────────────────────────────\n"
+    "sas_expiry = datetime.datetime.utcnow() + datetime.timedelta(hours=2)\n"
+    "sas_token  = generate_blob_sas(\n"
+    "    account_name=storage_account,\n"
+    "    container_name=container_name,\n"
+    "    blob_name=blob_name,\n"
+    "    account_key=storage_account_key,\n"
+    "    permission=BlobSasPermissions(read=True),\n"
+    "    expiry=sas_expiry,\n"
+    ")\n"
+    "build_context_sas_url = (\n"
+    "    f'https://{storage_account}.blob.core.windows.net/{container_name}/{blob_name}?{sas_token}'\n"
+    ")\n"
+    "print(f'SAS URL generated (valid until {sas_expiry.isoformat()} UTC)')\n"
+    "print(f'SAS URL (truncated): {build_context_sas_url[:120]}...')\n"
+))
+
+cells.append(M(
+    "### 2.5 · Trigger ACR Tasks Build & Push\n"
+    "\n"
+    "Uses the **Azure Container Registry Tasks REST API** to run a `DockerBuildRequest`\n"
+    "entirely inside Azure — no local Docker daemon required.\n"
+    "\n"
+    "**How ACR Tasks work:**\n"
+    "1. ACR downloads the build context tar.gz from the SAS URL\n"
+    "2. Runs `docker build -t <acr>/<image>:<tag> .` inside an ephemeral Azure VM\n"
+    "3. Pushes the built image to the same ACR\n"
+    "4. Returns a `run_id` that can be polled for status and logs\n"
+    "\n"
+    "The `scheduleRun` REST API is called directly with the Azure management token because\n"
+    "the `azure-mgmt-containerregistry>=14.0.0` SDK removed the `begin_schedule_run()` method\n"
+    "in favour of the newer `tasks` and `task_runs` operations. The run polling in Section 2.6\n"
+    "still uses the SDK's `runs.get()` which is available in all versions.\n"
+    "\n"
+    "The final image will be at `<acr_login_server>/<image_name>:<image_version>`.\n"
+))
+
+cells.append(C(
+    "import requests as _requests\n"
+    "from azure.mgmt.containerregistry import ContainerRegistryManagementClient\n"
+    "\n"
+    "acr_mgmt = ContainerRegistryManagementClient(credential, subscription_id)\n"
+    "\n"
+    "# ── Get ACR login server ───────────────────────────────────────────────────────\n"
+    "registry         = acr_mgmt.registries.get(acr_resource_group, acr_name)\n"
+    "acr_login_server = registry.login_server\n"
+    "full_image_name  = f'{acr_login_server}/{image_name}:{image_version}'\n"
+    "print(f'ACR login server : {acr_login_server}')\n"
+    "print(f'Target image     : {full_image_name}')\n"
+    "\n"
+    "# ── Get Azure management bearer token ─────────────────────────────────────────\n"
+    "mgmt_token = credential.get_token('https://management.azure.com/.default').token\n"
+    "\n"
+    "# ── Submit ACR scheduleRun via REST API ───────────────────────────────────────\n"
+    "# The azure-mgmt-containerregistry>=14 SDK removed begin_schedule_run().\n"
+    "# We call the REST API directly using the 2019-06-01-preview API version which\n"
+    "# still supports the DockerBuildRequest scheduleRun operation.\n"
+    "schedule_run_url = (\n"
+    "    f'https://management.azure.com/subscriptions/{subscription_id}'\n"
+    "    f'/resourceGroups/{acr_resource_group}'\n"
+    "    f'/providers/Microsoft.ContainerRegistry/registries/{acr_name}'\n"
+    "    f'/scheduleRun?api-version=2019-06-01-preview'\n"
+    ")\n"
+    "\n"
+    "build_body = {\n"
+    "    'type': 'DockerBuildRequest',\n"
+    "    'imageNames': [f'{image_name}:{image_version}'],\n"
+    "    'isPushEnabled': True,\n"
+    "    'sourceLocation': build_context_sas_url,\n"
+    "    'dockerFilePath': 'Dockerfile',\n"
+    "    'platform': {'os': 'Linux', 'architecture': 'amd64'},\n"
+    "    'timeout': 1800,\n"
+    "}\n"
+    "\n"
+    "print('\\nSubmitting ACR Tasks build request ...')\n"
+    "run_resp = _requests.post(\n"
+    "    schedule_run_url,\n"
+    "    headers={'Authorization': f'Bearer {mgmt_token}', 'Content-Type': 'application/json'},\n"
+    "    json=build_body,\n"
+    "    timeout=60,\n"
+    ")\n"
+    "\n"
+    "if run_resp.status_code not in (200, 202):\n"
+    "    raise RuntimeError(\n"
+    "        f'ACR scheduleRun failed: HTTP {run_resp.status_code}\\n{run_resp.text[:400]}'\n"
+    "    )\n"
+    "\n"
+    "run_data   = run_resp.json()\n"
+    "acr_run_id = run_data.get('name') or run_data.get('properties', {}).get('runId', '')\n"
+    "print(f'ACR build run submitted: run_id={acr_run_id}')\n"
+    "print(f'Initial status         : {run_data.get(\"properties\", {}).get(\"status\", \"Queued\")}')\n"
+))
+
+cells.append(M(
+    "### 2.6 · Wait for ACR Build to Complete\n"
+    "\n"
+    "Polls the ACR run status every 15 seconds until the build succeeds or fails.\n"
+    "Typical build time for the `tritonserver:23.08-py3` base layer pull + copy: **4–8 minutes**\n"
+    "(the base layer is cached in ACR's build infrastructure after the first run).\n"
+))
+
+cells.append(C(
+    "_ACR_BUILD_TIMEOUT = 900   # 15 min\n"
+    "_ACR_POLL_INTERVAL = 15\n"
+    "\n"
+    "print(f'Polling ACR build run {acr_run_id} ...')\n"
+    "start = time.time()\n"
+    "\n"
+    "while time.time() - start < _ACR_BUILD_TIMEOUT:\n"
+    "    run_status = acr_mgmt.runs.get(acr_resource_group, acr_name, acr_run_id)\n"
+    "    status     = run_status.status\n"
+    "    elapsed    = int(time.time() - start)\n"
+    "    print(f'[{elapsed:4d}s] {status}')\n"
+    "    if status in ('Succeeded', 'Failed', 'Canceled', 'Error', 'Timeout'):\n"
+    "        break\n"
+    "    time.sleep(_ACR_POLL_INTERVAL)\n"
+    "\n"
+    "print(f'\\nFinal status: {status}  (elapsed: {int(time.time() - start)}s)')\n"
+    "\n"
+    "if status != 'Succeeded':\n"
+    "    try:\n"
+    "        log_result = acr_mgmt.runs.get_log_sas_url(acr_resource_group, acr_name, acr_run_id)\n"
+    "        print(f'\\nBuild log URL:\\n  {log_result.log_link}')\n"
+    "    except Exception:\n"
+    "        pass\n"
+    "    raise RuntimeError(\n"
+    "        f'ACR build failed with status {status!r}.\\n'\n"
+    "        f'Check build logs via the URL above or:\\n'\n"
+    "        f'  Azure Portal -> ACR -> {acr_name} -> Runs -> {acr_run_id}'\n"
+    "    )\n"
+    "\n"
+    "print(f'\\nDocker image successfully built and pushed:')\n"
+    "print(f'  {full_image_name}')\n"
+))
+
+cells.append(M(
+    "### 2.7 · Fetch Image Digest from ACR\n"
+    "\n"
+    "KServe's underlying Knative Serving controller tries to resolve image tags to their\n"
+    "SHA-256 digest before scheduling pods. In this cluster, the Knative controller pods\n"
+    "cannot reach the workspace ACR directly (network policy), so tag resolution times out\n"
+    "and the ISVC never becomes Ready.\n"
+    "\n"
+    "**Fix:** retrieve the digest directly from ACR using our notebook's managed identity,\n"
+    "then reference the image as `<registry>/<image>@sha256:<digest>`. With a digest-based\n"
+    "reference, Knative skips tag resolution entirely — it already has the immutable content\n"
+    "address — so the pod can be scheduled without the controller needing ACR access.\n"
+    "\n"
+    "The sequence for managed-identity authentication against ACR:\n"
+    "1. Exchange AAD management token for an **ACR refresh token** via `/oauth2/exchange`\n"
+    "2. Exchange the refresh token for a repository-scoped **ACR access token** via `/oauth2/token`\n"
+    "3. Fetch the image manifest; the `Docker-Content-Digest` response header contains `sha256:...`\n"
+))
+
+cells.append(C(
+    "# ── Step 1: exchange AAD token for ACR OAuth2 refresh token ─────────────────\n"
+    "aad_token = credential.get_token('https://management.azure.com/.default').token\n"
+    "\n"
+    "exchange_resp = _requests.post(\n"
+    "    f'https://{acr_login_server}/oauth2/exchange',\n"
+    "    data={\n"
+    "        'grant_type':   'access_token',\n"
+    "        'service':      acr_login_server,\n"
+    "        'access_token': aad_token,\n"
+    "    },\n"
+    "    timeout=30,\n"
+    ")\n"
+    "exchange_resp.raise_for_status()\n"
+    "acr_refresh_token = exchange_resp.json()['refresh_token']\n"
+    "print(f'ACR refresh token obtained (length={len(acr_refresh_token)})')\n"
+    "\n"
+    "# ── Step 2: exchange refresh token for repo-scoped access token ───────────────\n"
+    "scope_resp = _requests.post(\n"
+    "    f'https://{acr_login_server}/oauth2/token',\n"
+    "    data={\n"
+    "        'grant_type':    'refresh_token',\n"
+    "        'service':       acr_login_server,\n"
+    "        'scope':         f'repository:{image_name}:pull',\n"
+    "        'refresh_token': acr_refresh_token,\n"
+    "    },\n"
+    "    timeout=30,\n"
+    ")\n"
+    "scope_resp.raise_for_status()\n"
+    "acr_access_token = scope_resp.json()['access_token']\n"
+    "print(f'ACR scoped access token obtained')\n"
+    "\n"
+    "# ── Step 3: fetch image manifest to get the content digest ───────────────────\n"
+    "manifest_resp = _requests.get(\n"
+    "    f'https://{acr_login_server}/v2/{image_name}/manifests/{image_version}',\n"
+    "    headers={\n"
+    "        'Authorization': f'Bearer {acr_access_token}',\n"
+    "        'Accept': 'application/vnd.docker.distribution.manifest.v2+json',\n"
+    "    },\n"
+    "    timeout=30,\n"
+    ")\n"
+    "manifest_resp.raise_for_status()\n"
+    "image_digest = manifest_resp.headers.get('Docker-Content-Digest', '')\n"
+    "\n"
+    "if not image_digest:\n"
+    "    raise RuntimeError(\n"
+    "        f'Could not retrieve image digest from ACR. '\n"
+    "        f'Response headers: {dict(manifest_resp.headers)}'\n"
+    "    )\n"
+    "\n"
+    "# Use digest-based reference: Knative skips tag resolution for @sha256: references\n"
+    "full_image_ref = f'{acr_login_server}/{image_name}@{image_digest}'\n"
+    "print(f'Image digest  : {image_digest}')\n"
+    "print(f'Image ref     : {full_image_ref}')\n"
+    "print()\n"
+    "print('Using digest-based image reference avoids Knative tag-to-digest resolution,')\n"
+    "print('which would otherwise time out (Knative controller cannot reach ACR in this cluster).')\n"
+))
+
+# ── Section 3 ─────────────────────────────────────────────────────────────────
+cells.append(M(
+    "---\n"
+    "## Section 3 — Inference Service Setup, Configuration & Deployment\n"
+    "\n"
+    "Configure Kubernetes access and deploy the KServe `InferenceService` with the custom\n"
+    "ACR container image.\n"
+    "\n"
+    "**Important difference from the sklearn/pytorch notebooks:** because the model is **baked\n"
+    "into the Docker image**, there is **no `storageUri`** and **no Azure Blob credential secret**\n"
+    "required. KServe starts the container directly — no storage initializer init-container runs.\n"
+    "\n"
+    "```\n"
+    "InferenceService created\n"
+    "  +-- Predictor pod scheduled\n"
+    "        +-- container: kserve-container  (our custom ACR image)\n"
+    "              +-- /models/poly_regressor/config.pbtxt   (baked in)\n"
+    "              +-- /models/poly_regressor/1/model.py     (baked in)\n"
+    "              +-- /models/poly_regressor/1/weights.npz  (baked in)\n"
+    "              +-- /opt/tritonserver/bin/tritonserver\n"
+    "                    --model-repository=/models\n"
+    "                    --model-control-mode=explicit\n"
+    "                    --load-model=poly_regressor\n"
+    "                    --http-port=8080  ->  READY\n"
+    "```\n"
+    "\n"
+    "**AKS -> ACR access:** a short-lived ACR access token is exchanged from the notebook pod's\n"
+    "Managed Identity and stored as a Kubernetes `docker-registry` secret (Section 3.2). The\n"
+    "ISVC `predictor.imagePullSecrets` references this secret so the kubelet can pull the image.\n"
+    "\n"
+    "**Image reference:** the container uses a digest-based reference\n"
+    "(`acr.io/image@sha256:...`) fetched in Section 2.7. This bypasses Knative's tag-to-digest\n"
+    "resolution step, which times out because the Knative controller pods cannot reach the\n"
+    "private ACR endpoint in this cluster.\n"
+))
+
+cells.append(M(
+    "### 3.1 · Configure Kubernetes Client\n"
+    "\n"
+    "Uses in-cluster config when running inside an AKS notebook pod. Falls back to\n"
+    "`az aks get-credentials` when running outside the cluster.\n"
+))
+
+cells.append(C(
+    "try:\n"
+    "    k8s_config.load_incluster_config()\n"
+    "    print('Kubernetes client configured via in-cluster config.')\n"
+    "    _using_incluster = True\n"
+    "except k8s_config.ConfigException:\n"
+    "    _using_incluster = False\n"
+    "    print('Not running inside AKS -- falling back to az aks get-credentials...')\n"
+    "    import subprocess\n"
+    "    aks_compute_name = 'cpu-2'\n"
+    "    compute          = ml_client.compute.get(aks_compute_name)\n"
+    "    _parts           = compute.resource_id.split('/')\n"
+    "    _aks_rg          = _parts[_parts.index('resourceGroups') + 1]\n"
+    "    _aks_name        = _parts[-1]\n"
+    "    result = subprocess.run(\n"
+    "        ['az', 'aks', 'get-credentials', '--resource-group', _aks_rg,\n"
+    "         '--name', _aks_name, '--overwrite-existing'],\n"
+    "        capture_output=True, text=True,\n"
+    "    )\n"
+    "    if result.returncode != 0:\n"
+    "        raise RuntimeError(f'az aks get-credentials failed: {result.stderr}')\n"
+    "    k8s_config.load_kube_config()\n"
+    "    print(result.stdout.strip() or 'kubeconfig updated.')\n"
+    "\n"
+    "v1   = k8s_client.CoreV1Api()\n"
+    "pods = v1.list_namespaced_pod(namespace=kserve_namespace)\n"
+    "print(f'Connected to cluster. Pods in {kserve_namespace!r}: {len(pods.items)}')\n"
+))
+
+cells.append(M(
+    "### 3.2 · Create ACR Image Pull Secret\n"
+    "\n"
+    "AKS node managed identities may not have `AcrPull` permissions pre-granted on the\n"
+    "workspace ACR. This cell creates a Kubernetes `docker-registry` secret from a\n"
+    "short-lived ACR access token obtained via Azure Managed Identity, so the kubelet can\n"
+    "pull our custom image.\n"
+))
+
+cells.append(C(
+    "import base64 as _b64\n"
+    "import requests as _requests\n"
+    "\n"
+    "# Get short-lived ACR access token via AAD -> ACR OAuth2 token exchange\n"
+    "_aad_token = credential.get_token('https://management.azure.com/.default').token\n"
+    "_exchange = _requests.post(\n"
+    "    f'https://{acr_login_server}/oauth2/exchange',\n"
+    "    data={'grant_type': 'access_token', 'service': acr_login_server, 'access_token': _aad_token},\n"
+    ")\n"
+    "_exchange.raise_for_status()\n"
+    "_refresh_token = _exchange.json()['refresh_token']\n"
+    "\n"
+    "_scope_resp = _requests.post(\n"
+    "    f'https://{acr_login_server}/oauth2/token',\n"
+    "    data={\n"
+    "        'grant_type':    'refresh_token',\n"
+    "        'service':       acr_login_server,\n"
+    "        'scope':         f'repository:{image_name}:pull',\n"
+    "        'refresh_token': _refresh_token,\n"
+    "    },\n"
+    ")\n"
+    "_scope_resp.raise_for_status()\n"
+    "_acr_token = _scope_resp.json()['access_token']\n"
+    "\n"
+    "# Build dockerconfigjson\n"
+    "_docker_cfg = {\n"
+    "    'auths': {\n"
+    "        acr_login_server: {\n"
+    "            'username': '00000000-0000-0000-0000-000000000000',\n"
+    "            'password': _acr_token,\n"
+    "            'auth':     _b64.b64encode(\n"
+    "                f'00000000-0000-0000-0000-000000000000:{_acr_token}'.encode()\n"
+    "            ).decode(),\n"
+    "        }\n"
+    "    }\n"
+    "}\n"
+    "_docker_cfg_b64 = _b64.b64encode(json.dumps(_docker_cfg).encode()).decode()\n"
+    "\n"
+    "# Upsert the secret in Kubernetes\n"
+    "v1 = k8s_client.CoreV1Api()\n"
+    "try:\n"
+    "    v1.delete_namespaced_secret(acr_pull_secret_name, kserve_namespace)\n"
+    "    print(f'Deleted existing secret {acr_pull_secret_name!r}')\n"
+    "except k8s_client.exceptions.ApiException as _e:\n"
+    "    if _e.status != 404:\n"
+    "        raise\n"
+    "_secret = k8s_client.V1Secret(\n"
+    "    metadata=k8s_client.V1ObjectMeta(name=acr_pull_secret_name, namespace=kserve_namespace),\n"
+    "    type='kubernetes.io/dockerconfigjson',\n"
+    "    data={'.dockerconfigjson': _docker_cfg_b64},\n"
+    ")\n"
+    "v1.create_namespaced_secret(kserve_namespace, _secret)\n"
+    "print(f'Created ACR pull secret {acr_pull_secret_name!r} in namespace {kserve_namespace!r}')\n"
+))
+
+cells.append(M(
+    "### 3.3 · Deploy KServe InferenceService with Custom Container\n"
+    "\n"
+    "Creates a KServe `InferenceService` using `predictor.containers` (the raw Kubernetes\n"
+    "container spec) instead of the built-in `predictor.triton` field. This is the\n"
+    "**KServe custom container** deployment pattern.\n"
+    "\n"
+    "The tritonserver invocation is fully baked into the image. The Dockerfile sets:\n"
+    "```\n"
+    "ENTRYPOINT [\"/opt/tritonserver/bin/tritonserver\"]\n"
+    "CMD [\"--model-repository=/models\", \"--model-control-mode=explicit\",\n"
+    "     \"--load-model=poly_regressor\", \"--http-port=8080\", \"--grpc-port=9000\"]\n"
+    "```\n"
+    "\n"
+    "Readiness and liveness probes hit Triton's built-in health endpoints:\n"
+    "- `GET /v2/health/ready` — 200 when all loaded models are ready\n"
+    "- `GET /v2/health/live` — 200 while the server process is alive\n"
+))
+
+cells.append(C(
+    "ks_client = KServeClient()\n"
+    "\n"
+    "isvc = V1beta1InferenceService(\n"
+    "    api_version=constants.KSERVE_V1BETA1,\n"
+    "    kind=constants.KSERVE_KIND_INFERENCESERVICE,\n"
+    "    metadata=k8s_client.V1ObjectMeta(\n"
+    "        name=inference_service_name,\n"
+    "        namespace=kserve_namespace,\n"
+    "        annotations={'sidecar.istio.io/inject': 'false'},\n"
+    "    ),\n"
+    "    spec=V1beta1InferenceServiceSpec(\n"
+    "        predictor=V1beta1PredictorSpec(\n"
+    "            # Use raw container spec -- the KServe 'custom container' pattern.\n"
+    "            # The model is already baked into the image; no storageUri is needed.\n"
+    "            # CMD in the Dockerfile already sets: tritonserver --model-repository=... etc.\n"
+    "            image_pull_secrets=[k8s_client.V1LocalObjectReference(name=acr_pull_secret_name)],\n"
+    "            containers=[\n"
+    "                k8s_client.V1Container(\n"
+    "                    name='kserve-container',\n"
+    "                    image=full_image_ref,   # digest ref: Knative skips tag resolution\n"
+    "                    # Do NOT declare ports here -- Knative adds containerPort 8080 (user-port)\n"
+    "                    # implicitly. Explicitly declaring ports triggers the queue-proxy's H2C\n"
+    "                    # upgrade probe, which Triton's HTTP server rejects with 405, blocking Ready.\n"
+
+    "                    resources=k8s_client.V1ResourceRequirements(\n"
+    "                        requests={'cpu': request_cpu, 'memory': request_ram},\n"
+    "                        limits={'cpu': limit_cpu,   'memory': limit_ram},\n"
+    "                    ),\n"
+    "                )\n"
+    "            ]\n"
+    "        )\n"
+    "    ),\n"
+    ")\n"
+    "\n"
+    "# Delete existing InferenceService if present (clean redeploy)\n"
+    "try:\n"
+    "    ks_client.delete(name=inference_service_name, namespace=kserve_namespace)\n"
+    "    print(f'Deleted existing InferenceService {inference_service_name!r}. Waiting 10s ...')\n"
+    "    time.sleep(10)\n"
+    "except Exception:\n"
+    "    pass\n"
+    "\n"
+    "ks_client.create(isvc)\n"
+    "print(f'InferenceService {inference_service_name!r} created in namespace {kserve_namespace!r}.')\n"
+    "print(f'Container image: {full_image_name}')\n"
+    "print(f'Triton will load model: {triton_model_name}')\n"
+    "print('Waiting for the service to become Ready ...')\n"
+))
+
+cells.append(M(
+    "### 3.3 · Wait for InferenceService Ready\n"
+    "\n"
+    "Polls the `InferenceService` status every 15 seconds. The first deployment includes a\n"
+    "Docker image pull from ACR (~1–2 min) plus Triton Python backend startup.\n"
+    "Subsequent deployments skip the pull if the image is already cached on the node.\n"
+))
+
+cells.append(C(
+    "_ISVC_TIMEOUT_SEC = 600   # 10 min\n"
+    "_POLL_INTERVAL    = 15\n"
+    "\n"
+    "start = time.time()\n"
+    "ready = False\n"
+    "\n"
+    "while time.time() - start < _ISVC_TIMEOUT_SEC:\n"
+    "    try:\n"
+    "        status_obj  = ks_client.get(name=inference_service_name, namespace=kserve_namespace)\n"
+    "        status_dict = status_obj if isinstance(status_obj, dict) else status_obj.to_dict()\n"
+    "        conditions  = status_dict.get('status', {}).get('conditions', []) or []\n"
+    "\n"
+    "        ready_cond = next((c for c in conditions if c.get('type') == 'Ready'), None)\n"
+    "        if ready_cond and ready_cond.get('status') == 'True':\n"
+    "            ready = True\n"
+    "            break\n"
+    "\n"
+    "        msg = ready_cond.get('message', 'waiting') if ready_cond else 'initializing'\n"
+    "        print(f'[{int(time.time() - start):4d}s] {msg}')\n"
+    "\n"
+    "    except Exception as poll_err:\n"
+    "        print(f'[{int(time.time() - start):4d}s] Polling error: {poll_err}')\n"
+    "\n"
+    "    time.sleep(_POLL_INTERVAL)\n"
+    "\n"
+    "if not ready:\n"
+    "    raise TimeoutError(\n"
+    "        f'InferenceService {inference_service_name!r} did not become Ready within '\n"
+    "        f'{_ISVC_TIMEOUT_SEC // 60} minutes.\\n'\n"
+    "        f'Diagnose with:\\n'\n"
+    "        f'  kubectl describe inferenceservice {inference_service_name} -n {kserve_namespace}\\n'\n"
+    "        f'  kubectl get pods -n {kserve_namespace}'\n"
+    "    )\n"
+    "\n"
+    "print(f'\\nInferenceService is Ready! (took {int(time.time() - start)}s)')\n"
+))
+
+cells.append(M(
+    "### 3.4 · Resolve Inference Endpoint URL\n"
+    "\n"
+    "Discovers the **ClusterIP service** created by Knative for the predictor revision, yielding a\n"
+    "cluster-internal `svc.cluster.local` URL that works from inside the AKS pod.\n"
+))
+
+cells.append(C(
+    "status_obj  = ks_client.get(name=inference_service_name, namespace=kserve_namespace)\n"
+    "status_dict = status_obj if isinstance(status_obj, dict) else status_obj.to_dict()\n"
+    "isvc_base_url = status_dict.get('status', {}).get('url', '')\n"
+    "\n"
+    "if _using_incluster:\n"
+    "    all_svcs = k8s_client.CoreV1Api().list_namespaced_service(\n"
+    "        namespace=kserve_namespace,\n"
+    "        label_selector=f'serving.knative.dev/service={inference_service_name}-predictor',\n"
+    "    ).items\n"
+    "    clusterip_svcs = [\n"
+    "        s for s in all_svcs\n"
+    "        if s.spec.type == 'ClusterIP' and not s.metadata.name.endswith('-private')\n"
+    "    ]\n"
+    "    if clusterip_svcs:\n"
+    "        svc_name    = clusterip_svcs[0].metadata.name\n"
+    "        svc_host    = f'{svc_name}.{kserve_namespace}.svc.cluster.local'\n"
+    "        scoring_uri = f'http://{svc_host}/v2/models/{triton_model_name}/infer'\n"
+    "        print(f'In-cluster mode: using ClusterIP service {svc_name!r}')\n"
+    "    else:\n"
+    "        scoring_uri = (\n"
+    "            f'http://{inference_service_name}-predictor.{kserve_namespace}'\n"
+    "            f'.svc.cluster.local/v2/models/{triton_model_name}/infer'\n"
+    "        )\n"
+    "        print('In-cluster mode: using standard KServe cluster-internal URL (fallback)')\n"
+    "elif isvc_base_url:\n"
+    "    scoring_uri = f'{isvc_base_url}/v2/models/{triton_model_name}/infer'\n"
+    "    print(f'External URL: {isvc_base_url}')\n"
+    "else:\n"
+    "    scoring_uri = (\n"
+    "        f'http://{inference_service_name}.{kserve_namespace}'\n"
+    "        f'.svc.cluster.local/v2/models/{triton_model_name}/infer'\n"
+    "    )\n"
+    "\n"
+    "print(f'\\nTriton inference URL : {scoring_uri}')\n"
+    "print()\n"
+    "print('External URL (from outside the cluster):')\n"
+    "print(f'  {isvc_base_url}/v2/models/{triton_model_name}/infer' if isvc_base_url else '  (not available)')\n"
+    "print()\n"
+    "print('kubectl port-forward alternative:')\n"
+    "print(\n"
+    "    f'  kubectl port-forward -n {kserve_namespace} '\n"
+    "    f'svc/{inference_service_name}-predictor 8080:80'\n"
+    ")\n"
+    "print(f'  Then use: http://localhost:8080/v2/models/{triton_model_name}/infer')\n"
+))
+
+# ── Section 4 ─────────────────────────────────────────────────────────────────
+cells.append(M(
+    "---\n"
+    "## Section 4 — Inference Service Testing\n"
+    "\n"
+    "Send live inference requests to the deployed custom Triton endpoint and verify the model's\n"
+    "predictions against the true target function `y = sin(x) + 0.5*sin(3x)`.\n"
+))
+
+cells.append(M(
+    "### 4.1 · Send Test Inference Requests\n"
+    "\n"
+    "Sends requests using the **KFServing V2 inference protocol** (same JSON format used by all\n"
+    "Triton-backed InferenceServices in this project).\n"
+    "\n"
+    "**Payload structure:**\n"
+    "```json\n"
+    '{"inputs": [{"name": "x", "shape": [N, 1], "datatype": "FP32", "data": [[x1], [x2], ...]}],\n'
+    ' "outputs": [{"name": "y"}]}\n'
+    "```\n"
+    "\n"
+    "Test cases cover key points of `y = sin(x) + 0.5*sin(3x)`:\n"
+    "\n"
+    "| x (radians) | True y | Notes |\n"
+    "|-------------|--------|-------|\n"
+    "| 0           | 0.000  | origin — both terms zero |\n"
+    "| pi/6 ~= 0.524 | 0.750  | sin(pi/6)=0.5, sin(pi/2)=1.0 -> 0.5+0.25=0.75 |\n"
+    "| pi/2 ~= 1.571 | 0.500  | sin(pi/2)=1, sin(3pi/2)=-1 -> 1.0-0.5=0.5 |\n"
+    "| pi ~= 3.142   | 0.000  | both terms vanish |\n"
+    "| -pi/4 ~= -0.785 | -0.854 | negative x |\n"
+))
+
+cells.append(C(
+    "import requests as http_requests\n"
+    "import math\n"
+    "\n"
+    "headers = {'Content-Type': 'application/json'}\n"
+    "\n"
+    "# Reference function (same as training target)\n"
+    "def true_y(x):\n"
+    "    return math.sin(x) + 0.5 * math.sin(3 * x)\n"
+    "\n"
+    "test_cases = [\n"
+    "    ('0',       0.0),\n"
+    "    ('pi/6',    math.pi / 6),\n"
+    "    ('pi/2',    math.pi / 2),\n"
+    "    ('pi',      math.pi),\n"
+    "    ('-pi/4',  -math.pi / 4),\n"
+    "]\n"
+    "\n"
+    "print(f'{\"x\":12s}  {\"true y\":>10s}  {\"pred y\":>10s}  {\"abs err\":>10s}  pass')\n"
+    "print('-' * 56)\n"
+    "\n"
+    "all_pass = True\n"
+    "for label, x_val in test_cases:\n"
+    "    payload = {\n"
+    "        'inputs': [{\n"
+    "            'name':     'x',\n"
+    "            'shape':    [1, 1],\n"
+    "            'datatype': 'FP32',\n"
+    "            'data':     [[x_val]],\n"
+    "        }],\n"
+    "        'outputs': [{'name': 'y'}],\n"
+    "    }\n"
+    "    resp = http_requests.post(\n"
+    "        scoring_uri, headers=headers, json=payload, verify=False, timeout=30\n"
+    "    )\n"
+    "    if resp.status_code != 200:\n"
+    "        print(f'{label:12s}  HTTP {resp.status_code}: {resp.text[:80]}')\n"
+    "        all_pass = False\n"
+    "        continue\n"
+    "\n"
+    "    parsed = resp.json()\n"
+    "    if isinstance(parsed, str):\n"
+    "        parsed = json.loads(parsed)\n"
+    "\n"
+    "    y_pred = parsed['outputs'][0]['data'][0]\n"
+    "    y_true = true_y(x_val)\n"
+    "    error  = abs(y_pred - y_true)\n"
+    "    ok     = error < 0.05\n"
+    "    all_pass = all_pass and ok\n"
+    "    print(f'{label:12s}  {y_true:>+10.4f}  {y_pred:>+10.4f}  {error:>10.6f}  {\"v\" if ok else \"x\"}')\n"
+    "\n"
+    "print()\n"
+    "print('All test cases passed' if all_pass else 'Some test cases FAILED')\n"
+))
+
+cells.append(M(
+    "#### Batch inference\n"
+    "\n"
+    "The Triton Python backend supports batching — send multiple `x` values in a single\n"
+    "request with shape `[N, 1]`.\n"
+))
+
+cells.append(C(
+    "# ── Batch inference: all test x values in one request ─────────────────────────\n"
+    "x_values = [x for _, x in test_cases]\n"
+    "payload_batch = {\n"
+    "    'inputs': [{\n"
+    "        'name':     'x',\n"
+    "        'shape':    [len(x_values), 1],\n"
+    "        'datatype': 'FP32',\n"
+    "        'data':     [[xv] for xv in x_values],\n"
+    "    }],\n"
+    "    'outputs': [{'name': 'y'}],\n"
+    "}\n"
+    "\n"
+    "resp_batch = http_requests.post(\n"
+    "    scoring_uri, headers=headers, json=payload_batch, verify=False, timeout=30\n"
+    ")\n"
+    "print(f'Batch HTTP status: {resp_batch.status_code}')\n"
+    "\n"
+    "if resp_batch.status_code == 200:\n"
+    "    result = resp_batch.json()\n"
+    "    if isinstance(result, str):\n"
+    "        result = json.loads(result)\n"
+    "\n"
+    "    y_preds = result['outputs'][0]['data']\n"
+    "    print(f'Batch response shape: {result[\"outputs\"][0][\"shape\"]}')\n"
+    "    print()\n"
+    "    print('Batch predictions:')\n"
+    "    for (label, xv), yp in zip(test_cases, y_preds):\n"
+    "        print(f'  x={label:10s}  pred={yp:+.4f}  true={true_y(xv):+.4f}')\n"
+    "\n"
+    "    print()\n"
+    "    print('Full KFServing V2 batch response:')\n"
+    "    print(json.dumps(result, indent=2))\n"
+    "\n"
+    "# Equivalent curl command for a single inference\n"
+    "print()\n"
+    "print('Equivalent curl command (x=pi/2):')\n"
+    "print(\n"
+    "    f'curl -X POST {scoring_uri!r} '\n"
+    "    f'-H \\'Content-Type: application/json\\' '\n"
+    "    f'-d \\'{{\"inputs\":[{{\"name\":\"x\",\"shape\":[1,1],\"datatype\":\"FP32\",'\n"
+    "    f'\"data\":[[{math.pi/2:.4f}]]}}]}}\\'' \n"
+    ")\n"
+))
+
+cells.append(M(
+    "### 4.2 · Cleanup (Optional)\n"
+    "\n"
+    "Uncomment to delete the KServe `InferenceService`.\n"
+    "Unlike the sklearn/pytorch notebooks, there are no patched secrets to restore here.\n"
+    "\n"
+    "> Run this cell when you are done testing to free cluster resources.\n"
+))
+
+cells.append(C(
+    "# ── Delete InferenceService ───────────────────────────────────────────────────\n"
+    "# ks_client.delete(name=inference_service_name, namespace=kserve_namespace)\n"
+    "# print(f'InferenceService {inference_service_name!r} deleted.')\n"
+))
+
+# ── Write notebook ─────────────────────────────────────────────────────────────
+nb = new_notebook(cells=cells)
+nb.metadata["kernelspec"] = {
+    "display_name": "Python 3",
+    "language": "python",
+    "name": "python3",
+}
+nb.metadata["language_info"] = {
+    "name": "python",
+    "version": "3.11.0",
+}
+
+out_path = (
+    "/home/jovyan/ai-platform-aml-triton-examples/"
+    "python-custom-triton-kserve-deployment.ipynb"
+)
+with open(out_path, "w") as f:
+    nbformat.write(nb, f)
+
+print(f"Written : {out_path}")
+print(f"Cells   : {len(cells)}")

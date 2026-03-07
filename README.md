@@ -14,6 +14,7 @@ Kubernetes Online Endpoints** with a Triton-compatible KFServing V2 API.
 | [`train-on-ai-platform-aks-triton-n-models.ipynb`](#multi-model-notebook) | [`train-on-ai-platform-aks-triton-n-models-output.ipynb`](train-on-ai-platform-aks-triton-n-models-output.ipynb) | Train sklearn + PyTorch models, deploy **both** to a single endpoint with model control mode |
 | [`sklearn-triton-kserve-deployment.ipynb`](#kserve-sklearn-notebook) | [`sklearn-triton-kserve-deployment-output.ipynb`](sklearn-triton-kserve-deployment-output.ipynb) | Fetch the latest `iris_classifier` Triton model from AML, deploy directly to **KServe** (no AzureML Online Endpoint, no retraining) |
 | [`pytorch-triton-kserve-deployment.ipynb`](#kserve-pytorch-notebook) | [`pytorch-triton-kserve-deployment-output.ipynb`](pytorch-triton-kserve-deployment-output.ipynb) | Fetch the latest `pytorch_sine` Triton model from AML, deploy directly to **KServe** using explicit model control mode |
+| [`python-custom-triton-kserve-deployment.ipynb`](#python-custom-triton-kserve-notebook) | [`python-custom-triton-kserve-deployment-output.ipynb`](python-custom-triton-kserve-deployment-output.ipynb) | Train a custom pure-NumPy polynomial model locally, package it as a **Triton Python backend**, build & push a Docker image to ACR, and deploy directly to **KServe** (no AzureML endpoint) |
 
 ---
 
@@ -317,6 +318,153 @@ of the true `sin(x)`.
 
 ---
 
+## Python Custom Triton KServe Notebook
+
+`python-custom-triton-kserve-deployment.ipynb` · output: [`python-custom-triton-kserve-deployment-output.ipynb`](python-custom-triton-kserve-deployment-output.ipynb)
+
+Trains a **custom pure-NumPy polynomial regression model** from scratch, packages it as a
+**Triton Python backend** (no ONNX, no sklearn), builds a Docker image in ACR, and deploys
+it to **KServe** — entirely without AzureML Online Endpoints or an AML pipeline.
+
+This notebook demonstrates how to use the Triton `python` backend for arbitrary Python
+inference code when no standard ONNX-compatible framework is involved.
+
+### vs. `pytorch-triton-kserve-deployment.ipynb`
+
+| | PyTorch KServe notebook | Python-custom KServe notebook |
+|-|------------------------|-------------------------------|
+| **Model format** | ONNX (TorchScript export) | Native `.npz` weights (NumPy) |
+| **Triton backend** | `onnxruntime` | `python` (custom `model.py`) |
+| **Image source** | Triton built-in | Custom Docker image built in ACR |
+| **Image delivery** | AML storageUri | ACR image with pull secret |
+| **Auth** | Storage account key | AAD → ACR OAuth2 token exchange |
+
+### Notebook sections
+
+#### Section 1 — Setup & Configuration
+Install dependencies, set configuration variables (ACR login server, image name/version,
+KServe namespace, compute resource limits), import libraries, connect to Azure via
+Managed Identity.
+
+#### Section 2 — Model Training
+
+| Step | Description |
+|------|-------------|
+| 2.1 | Define `y = sin(x) + 0.5·sin(3x)` training target over `[-π, π]` (200 points) |
+| 2.2 | Build degree-13 polynomial features with `x_scale = π` normalisation to `[-1, 1]` |
+| 2.3 | Fit Ridge regression (`alpha=1e-8`); achieves RMSE < 0.004 on training data |
+| 2.4 | Save weights as `model_repo/poly_regressor/1/model.npz` (`coefficients`, `intercept`, `degree`, `x_scale`) |
+| 2.5 | Write `config.pbtxt` (`backend: "python"`, `max_batch_size: 0`, explicit input/output tensor shapes) |
+| 2.6 | Write `model.py` — Triton `TritonPythonModel`: `initialize` loads `.npz`; `execute` applies x_scale + polynomial feature expansion + matrix multiply |
+
+#### Section 3 — Build & Deploy
+
+| Step | Description |
+|------|-------------|
+| 3.1 | Write `Dockerfile` — `FROM nvcr.io/nvidia/tritonserver:23.08-py3`; copies `model_repo`; sets `ENTRYPOINT ["/opt/tritonserver/bin/tritonserver"]` with `--http-port=8080`; EXPOSE 8080 9000 8002 |
+| 3.2 | Trigger **ACR Tasks** build via REST (`POST .../scheduleRun?api-version=2019-06-01-preview` with `DockerBuildRequest`); poll until `Succeeded` |
+| 3.3 | Resolve the pushed image digest from the ACR build log; form `acr.io/image@sha256:<digest>` to bypass Knative tag-to-digest resolution timeout |
+| 3.4 | Configure Kubernetes client (in-cluster config) |
+| 3.5 | Create a `kubernetes.io/dockerconfigjson` pull secret via AAD → ACR OAuth2 token exchange (AAD management token → refresh token → repo-scoped access token) |
+| 3.6 | Deploy `InferenceService` with `V1beta1PredictorSpec` container (digest image ref, pull secret, CPU/memory limits); **no explicit `ports`** — Knative adds port 8080 implicitly, avoiding the queue-proxy H2C upgrade probe |
+| 3.7 | Poll until `Ready = True` (15-second interval, 10-minute timeout) |
+| 3.8 | Resolve cluster-internal ClusterIP service URL |
+
+#### Section 4 — Inference Testing
+
+Sends 5 test cases and verifies each `|predicted − true|` < 0.05:
+
+| x | true y | Result |
+|---|--------|--------|
+| 0 | 0.000 | pass |
+| π/6 | 1.000 | pass |
+| π/2 | 0.500 | pass |
+| π | 0.000 | pass |
+| −π/4 | −1.061 | pass |
+
+### Model Architecture
+
+A degree-13 polynomial regressor approximating `y = sin(x) + 0.5·sin(3x)`:
+
+```
+x ∈ ℝ  →  x_norm = x / π  →  [x_norm¹, x_norm², …, x_norm¹³]  →  Ridge(α=1e-8)  →  ŷ
+```
+
+- Normalisation to `[-1, 1]` avoids catastrophic cancellation (x^13 ≈ 3×10⁶ at `x=π`
+  without normalisation; ≈ 1.0 with it)
+- Degree-13 captures the target's two-frequency structure with RMSE < 0.004
+
+### Triton Python Backend
+
+The custom `model.py` implements the three required lifecycle methods:
+
+```python
+class TritonPythonModel:
+    def initialize(self, args):
+        params = json.loads(args['model_config'])['parameters']
+        data = np.load(os.path.join(args['model_repository'], args['model_version'], 'model.npz'))
+        self.coef       = data['coefficients']
+        self.intercept  = data['intercept']
+        self.degree     = int(data['degree'])
+        self.x_scale    = float(data['x_scale'])
+
+    def execute(self, requests):
+        responses = []
+        for req in requests:
+            x = pb_utils.get_input_tensor_by_name(req, 'x').as_numpy()
+            x_norm = x / self.x_scale
+            X = np.column_stack([x_norm.ravel() ** i for i in range(1, self.degree + 1)])
+            y = X @ self.coef + self.intercept
+            out = pb_utils.Tensor('y', y.reshape(-1, 1).astype(np.float32))
+            responses.append(pb_utils.InferenceResponse([out]))
+        return responses
+```
+
+### Inference API
+
+**Request:**
+```json
+{"inputs": [{"name": "x", "shape": [1, 1], "datatype": "FP32", "data": [[1.5708]]}]}
+```
+
+**Response:**
+```json
+{
+  "model_name": "poly_regressor", "model_version": "1",
+  "outputs": [{"name": "y", "shape": [1, 1], "datatype": "FP32", "data": [0.4969]}]
+}
+```
+
+### Key Implementation Notes
+
+- **ENTRYPOINT override** — The NVIDIA base image entrypoint (`nvidia_entrypoint.sh`) passes
+  CMD args as positional parameters and runs `exec "$@"`. When `$1` starts with `--`, bash's
+  `exec` parses it as an exec option and crashes with `invalid option`. Fix: override
+  `ENTRYPOINT ["/opt/tritonserver/bin/tritonserver"]` in the Dockerfile, bypassing the
+  wrapper entirely.
+
+- **No explicit ports in ISVC** — Explicitly declaring `containerPort: 8080` in the KServe
+  `V1Container` triggers the Knative queue-proxy's HTTP/2 upgrade probe. Triton's HTTP server
+  returns 405, blocking the pod from becoming Ready. Omitting ports lets Knative add port
+  8080 implicitly (as `user-port`) without triggering the probe.
+
+- **Digest-based image reference** — Using `image@sha256:<digest>` instead of `image:tag`
+  bypasses Knative's tag-to-digest resolution step (a separate HTTPS call to the registry
+  that can time out for private ACR). The digest is extracted from the ACR build log.
+
+- **ACR pull secret via OAuth2** — AKS node managed identity does not automatically have
+  `AcrPull` on the workspace ACR. A repo-scoped ACR access token is obtained via
+  AAD→ACR token exchange and stored as a `kubernetes.io/dockerconfigjson` secret.
+
+### Prerequisites
+
+- KServe installed in the AKS cluster
+- Notebook running **inside** the AKS cluster (in-cluster K8s config)
+- Managed Identity with `AcrPush` + ACR Tasks access on the workspace ACR
+- `azure-acr-build` or equivalent role for triggering ACR Tasks
+
+---
+
 ## Repository Structure
 
 ```
@@ -327,6 +475,8 @@ ai-platform-aml-triton-examples/
 ├── sklearn-triton-kserve-deployment-output.ipynb      # Last successful execution output
 ├── pytorch-triton-kserve-deployment.ipynb             # KServe notebook — pytorch_sine (MLP sine)
 ├── pytorch-triton-kserve-deployment-output.ipynb      # Last successful execution output
+├── python-custom-triton-kserve-deployment.ipynb       # KServe notebook — poly_regressor (Triton Python backend)
+├── python-custom-triton-kserve-deployment-output.ipynb  # Last successful execution output
 ├── requirements.txt                                    # Runtime Python dependencies
 ├── requirements-dev.txt                            # Dev/test dependencies (pytest, pytest-mock)
 ├── pytest.ini                                      # Test configuration (testpaths, pythonpath, markers)
@@ -393,6 +543,7 @@ jupyter lab
 - **Multiple models** (train + AzureML endpoint): open `train-on-ai-platform-aks-triton-n-models.ipynb`
 - **KServe — iris classifier** (no retraining, no AzureML endpoint): open `sklearn-triton-kserve-deployment.ipynb`
 - **KServe — pytorch sine** (no retraining, no AzureML endpoint): open `pytorch-triton-kserve-deployment.ipynb`
+- **KServe — custom Python backend** (train locally, build Docker image, deploy to KServe): open `python-custom-triton-kserve-deployment.ipynb`
 
 Run all cells top-to-bottom.
 
