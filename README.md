@@ -534,34 +534,34 @@ that secret automatically.
   Notebook pod                     Kubernetes                    Inference pod
   (has Managed Identity)                                         (no Managed Identity)
          │                                                               │
-         │  1. az storage account keys list                             │
-         │ ─────────────────────────────►  Azure Storage API           │
-         │ ◄─────────────────────────────  { "key": "abc123..." }      │
+         │  1. az storage account keys list                              │
+         │ ─────────────────────────────►  Azure Storage API             │
+         │ ◄─────────────────────────────  { "key": "abc123..." }        │
          │                                                               │
          │  2. kubectl create secret                                     │
          │     azure-storage-secret                                      │
-         │ ──────────────────────────────────────────────►              │
-         │                         ┌────────────────────────────────┐   │
-         │                         │  K8s Secret                    │   │
-         │                         │  name: azure-storage-secret    │   │
-         │                         │  AZURE_STORAGE_ACCESS_KEY=...  │   │
-         │                         └────────────┬───────────────────┘   │
+         │ ──────────────────────────────────────────────►               │
+         │                         ┌────────────────────────────────┐    │
+         │                         │  K8s Secret                    │    │
+         │                         │  name: azure-storage-secret    │    │
+         │                         │  AZURE_STORAGE_ACCESS_KEY=...  │    │
+         │                         └────────────┬───────────────────┘    │
          │                                      │                        │
-         │  3. kubectl apply InferenceService    │                        │
-         │     (storageUri: azureml://...)       │                        │
-         │ ──────────────────────────────────────────────►              │
+         │  3. kubectl apply InferenceService    │                       │
+         │     (storageUri: azureml://...)       │                       │
+         │ ──────────────────────────────────────────────►               │
          │                                      │  4. KServe reads       │
          │                                      │     ClusterStorage-    │
          │                                      │     Container config   │
          │                                      │     → mounts secret    │
          │                                      ▼                        │
-         │                         ┌────────────────────────────────┐   │
-         │                         │  Storage Initializer sidecar   │   │
-         │                         │  (runs first, before Triton)   │   │
-         │                         │                                │   │
-         │                         │  AZURE_STORAGE_ACCESS_KEY ◄───┘   │
-         │                         │  azureml://... → /mnt/models/  │   │
-         │                         └────────────────────────────────┘   │
+         │                         ┌────────────────────────────────┐    │
+         │                         │  Storage Initializer sidecar   │    │
+         │                         │  (runs first, before Triton)   │    │
+         │                         │                                │    │
+         │                         │  AZURE_STORAGE_ACCESS_KEY ◄───┘     │
+         │                         │  azureml://... → /mnt/models/  │    │
+         │                         └────────────────────────────────┘    │
          │                                                               │
          │                                              5. Triton starts │
          │                                                 /mnt/models/  │
