@@ -465,6 +465,197 @@ class TritonPythonModel:
 
 ---
 
+## Secrets & the Inference Service
+
+Kubernetes pods — including KServe inference pods — run in an isolated environment with no
+automatic access to Azure resources. Secrets are the bridge: you create them once in
+Kubernetes, and KServe/Knative picks them up automatically at deploy time.
+
+Two distinct secret patterns appear across the notebooks, depending on where the model comes
+from and how the container image is delivered.
+
+---
+
+### Pattern 1 — Model Storage Secret (sklearn + PyTorch notebooks)
+
+**Used by:** `sklearn-triton-kserve-deployment.ipynb`, `pytorch-triton-kserve-deployment.ipynb`
+
+**The problem:** The model lives in Azure Blob Storage. When KServe starts the inference pod
+it launches a sidecar container called the **storage initializer** whose job is to download
+the model files before Triton starts. That sidecar needs the Azure storage account key — but
+it runs as a plain pod with no Managed Identity attached.
+
+**The solution:** The notebook reads the key using its own Managed Identity, writes it into a
+Kubernetes Secret, and tells KServe which secret to use via a cluster-level
+`ClusterStorageContainer` configuration. KServe's storage initializer then reads the key from
+that secret automatically.
+
+```
+  Notebook pod                     Kubernetes                    Inference pod
+  (has Managed Identity)                                         (no Managed Identity)
+         │                                                               │
+         │  1. az storage account keys list                             │
+         │ ─────────────────────────────►  Azure Storage API           │
+         │ ◄─────────────────────────────  { "key": "abc123..." }      │
+         │                                                               │
+         │  2. kubectl create secret                                     │
+         │     azure-storage-secret                                      │
+         │ ──────────────────────────────────────────────►              │
+         │                         ┌────────────────────────────────┐   │
+         │                         │  K8s Secret                    │   │
+         │                         │  name: azure-storage-secret    │   │
+         │                         │  AZURE_STORAGE_ACCESS_KEY=...  │   │
+         │                         └────────────┬───────────────────┘   │
+         │                                      │                        │
+         │  3. kubectl apply InferenceService    │                        │
+         │     (storageUri: azureml://...)       │                        │
+         │ ──────────────────────────────────────────────►              │
+         │                                      │  4. KServe reads       │
+         │                                      │     ClusterStorage-    │
+         │                                      │     Container config   │
+         │                                      │     → mounts secret    │
+         │                                      ▼                        │
+         │                         ┌────────────────────────────────┐   │
+         │                         │  Storage Initializer sidecar   │   │
+         │                         │  (runs first, before Triton)   │   │
+         │                         │                                │   │
+         │                         │  AZURE_STORAGE_ACCESS_KEY ◄───┘   │
+         │                         │  azureml://... → /mnt/models/  │   │
+         │                         └────────────────────────────────┘   │
+         │                                                               │
+         │                                              5. Triton starts │
+         │                                                 /mnt/models/  │
+         │                                                 (model ready) │
+```
+
+**The `mlpipeline-minio-artifact.secretkey` patch**
+
+The `ClusterStorageContainer` in this cluster is configured to always inject
+`AZURE_STORAGE_ACCESS_KEY` from a specific secret key named `secretkey` inside the secret
+called `mlpipeline-minio-artifact`. This secret normally holds a MinIO password.
+
+The notebook temporarily overwrites that key with the real Azure storage key so the storage
+initializer picks it up, then restores the original MinIO value in the cleanup cell.
+
+```
+  Before notebook runs:                After Section 3.2:              After cleanup:
+  ┌──────────────────────┐             ┌──────────────────────┐        ┌──────────────────────┐
+  │ mlpipeline-minio-... │             │ mlpipeline-minio-... │        │ mlpipeline-minio-... │
+  │  secretkey = <minio> │  ─────────► │  secretkey = <azure> │ ─────► │  secretkey = <minio> │
+  └──────────────────────┘  (patched)  └──────────────────────┘        └──────────────────────┘
+                                                  │
+                                        storage initializer
+                                        reads this key to
+                                        access Azure Blob
+```
+
+---
+
+### Pattern 2 — ACR Image Pull Secret (Python-custom notebook)
+
+**Used by:** `python-custom-triton-kserve-deployment.ipynb`
+
+**The problem:** The model is baked directly into a custom Docker image stored in Azure
+Container Registry (ACR). When Kubernetes tries to pull that image onto a node, it needs
+valid registry credentials. AKS node identities are not automatically granted `AcrPull`
+permission on the workspace ACR.
+
+**The solution:** The notebook exchanges its Managed Identity token for a short-lived
+ACR access token and stores it as a Kubernetes `dockerconfigjson` secret. The
+`InferenceService` spec references this secret via `imagePullSecrets`, and Kubernetes uses
+it when pulling the image.
+
+```
+  Notebook pod                                   Kubernetes              AKS node (kubelet)
+  (has Managed Identity)
+         │
+         │  1. Get AAD token for management.azure.com
+         │ ──────────────────────►  Azure AD
+         │ ◄──────────────────────  aad_token
+         │
+         │  2. Exchange AAD token for ACR refresh token
+         │ ──────────────────────►  ACR  /oauth2/exchange
+         │ ◄──────────────────────  acr_refresh_token
+         │
+         │  3. Exchange refresh token for repo-scoped access token
+         │ ──────────────────────►  ACR  /oauth2/token
+         │                              scope: repository:image:pull
+         │ ◄──────────────────────  acr_access_token  (short-lived)
+         │
+         │  4. Package token as a docker config JSON
+         │     { "auths": { "acr.io": { "username": "00000000-...", "password": "<token>" }}}
+         │
+         │  5. kubectl create secret docker-registry
+         │     poly-regressor-triton-acr-pull
+         │ ─────────────────────────────────────────────────────────────►
+         │                                    ┌──────────────────────────────────────┐
+         │                                    │  K8s Secret (dockerconfigjson)       │
+         │                                    │  name: poly-regressor-triton-acr-pull│
+         │                                    │  .dockerconfigjson = { "auths":...} │
+         │                                    └──────────────┬───────────────────────┘
+         │                                                   │
+         │  6. kubectl apply InferenceService                │
+         │     imagePullSecrets:                             │
+         │       - poly-regressor-triton-acr-pull            │
+         │ ─────────────────────────────────────────────────────────────►
+         │                                                   │
+         │                                       7. Knative / kubelet pulls image
+         │                                          presents credentials from secret
+         │                                                   │
+         │                                                   ▼
+         │                                          ACR  (authenticates)
+         │                                          → streams image layers to node
+         │                                          → container starts
+```
+
+**Why a short-lived token is fine**
+
+The ACR access token only needs to be valid during the image pull. Once the image is cached
+on the node, Kubernetes won't re-pull unless the pod is rescheduled to a different node or
+the image is evicted. Re-running the notebook regenerates a fresh token before each
+deployment.
+
+---
+
+### Side-by-side comparison
+
+| | Storage Secret (sklearn/PyTorch) | Pull Secret (Python-custom) |
+|-|----------------------------------|------------------------------|
+| **What it unlocks** | Permission to read model files from Azure Blob | Permission to pull the container image from ACR |
+| **Who uses it** | KServe storage initializer sidecar | Kubernetes kubelet on the node |
+| **Secret type** | `Opaque` (key/value env var) | `kubernetes.io/dockerconfigjson` |
+| **Credential source** | Azure Storage account key (permanent) | ACR access token (short-lived, repo-scoped) |
+| **How it's referenced** | Cluster-level `ClusterStorageContainer` config | `spec.predictor.imagePullSecrets` in the ISVC |
+| **Lifetime** | Stays in cluster; must be rotated when key changes | Recreated each notebook run |
+| **Cleanup needed?** | Yes — restores MinIO key in cleanup cell | No — old secret is deleted and replaced at start of cell 3.5 |
+
+---
+
+### Where secrets appear in the pod lifecycle
+
+```
+  ┌────────────────────────────────────────────────────────────────┐
+  │                   InferenceService Pod                         │
+  │                                                                │
+  │  ┌──────────────────────────────┐  ┌────────────────────────┐ │
+  │  │  Storage Initializer         │  │  Triton Server         │ │
+  │  │  (init container, runs first)│  │  (main container)      │ │
+  │  │                              │  │                        │ │
+  │  │  Reads: azure-storage-secret │  │  Reads: model files    │ │
+  │  │  Downloads model from Blob   │  │  from /mnt/models/     │ │
+  │  │  → writes to /mnt/models/    │  │  (mounted volume)      │ │
+  │  └──────────────────────────────┘  └────────────────────────┘ │
+  │                                                                │
+  │  Image pulled using: imagePullSecret  ◄── ACR pull secret     │
+  │  (happens before pod starts, at the node/kubelet level)       │
+  └────────────────────────────────────────────────────────────────┘
+
+  Pattern 1 (model from Blob):   storage secret ──► storage initializer ──► /mnt/models/
+  Pattern 2 (model in image):    pull secret ──► kubelet ──► image layers cached on node
+```
+
+---
+
 ## Repository Structure
 
 ```
