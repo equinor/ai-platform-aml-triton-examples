@@ -496,9 +496,9 @@ Identity**, which links a Kubernetes service account to a Managed Identity in Az
             │  intercepts pod creation                                │
             ▼                                                         │
   Notebook pod gets injected env vars:                                │
-    AZURE_CLIENT_ID     = <managed-identity-client-id>               │
+    AZURE_CLIENT_ID     = <managed-identity-client-id>                │
     AZURE_TENANT_ID     = <tenant>                                    │
-    AZURE_FEDERATED_TOKEN_FILE = /var/run/secrets/...token           │
+    AZURE_FEDERATED_TOKEN_FILE = /var/run/secrets/...token            │
             │                                                         │
             │  DefaultAzureCredential() picks up these vars           │
             │  and presents the federated token to Azure AD           │
@@ -664,7 +664,7 @@ it when pulling the image.
          │                                    ┌──────────────────────────────────────┐
          │                                    │  K8s Secret (dockerconfigjson)       │
          │                                    │  name: poly-regressor-triton-acr-pull│
-         │                                    │  .dockerconfigjson = { "auths":...} │
+         │                                    │  .dockerconfigjson = { "auths":...}  │
          │                                    └──────────────┬───────────────────────┘
          │                                                   │
          │  6. kubectl apply InferenceService                │
@@ -759,9 +759,9 @@ Three service accounts play a role. None of them is the same account.
   │  │ What it does:           │       │                                     │  │
   │  │  Lets the notebook pod  │       │ What it does:                       │  │
   │  │  call Azure APIs via    │       │  Watches for new/changed ISVCs,     │  │
-  │  │  Workload Identity       │       │  reads ClusterStorageContainer,     │  │
-  │  │  (no Azure secret        │       │  injects storage secrets into       │  │
-  │  │  stored in K8s)          │       │  the storage initializer container  │  │
+  │  │  Workload Identity      │       │  reads ClusterStorageContainer,     │  │
+  │  │  (no Azure secret       │       │  injects storage secrets into       │  │
+  │  │  stored in K8s)         │       │  the storage initializer container  │  │
   │  └─────────────────────────┘       └─────────────────────────────────────┘  │
   │                                                                             │
   │  Namespace: kserve  (inference pods)                                        │
@@ -769,13 +769,13 @@ Three service accounts play a role. None of them is the same account.
   │  │ ServiceAccount: default                                              │   │
   │  │                                                                      │   │
   │  │ What it does:                                                        │   │
-  │  │  All inference pods run under this account by default.              │   │
-  │  │  It has no special permissions — Azure storage access comes from    │   │
+  │  │  All inference pods run under this account by default.               │   │
+  │  │  It has no special permissions — Azure storage access comes from     │   │
   │  │  the injected env var (Pattern 1), and image pull credentials        │   │
-  │  │  come from the pod-spec imagePullSecrets (Pattern 2).               │   │
+  │  │  come from the pod-spec imagePullSecrets (Pattern 2).                │   │
   │  │                                                                      │   │
-  │  │  Optional: attach imagePullSecrets here to avoid per-ISVC           │   │
-  │  │  configuration (see Option B in Pattern 2 above).                   │   │
+  │  │  Optional: attach imagePullSecrets here to avoid per-ISVC            │   │
+  │  │  configuration (see Option B in Pattern 2 above).                    │   │
   │  └──────────────────────────────────────────────────────────────────────┘   │
   └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -792,7 +792,7 @@ Three service accounts play a role. None of them is the same account.
 
 ```
                 ┌─ kserve-controller-manager (service account) ──────────────────┐
-                │  reads ClusterStorageContainer, injects secret into pod spec    │
+                │  reads ClusterStorageContainer, injects secret into pod spec   │
                 └────────────────────────────────┬───────────────────────────────┘
                                                  │ creates pod
                                                  ▼
@@ -804,17 +804,17 @@ Three service accounts play a role. None of them is the same account.
   │  │  or node's pre-granted ACR role; presents credentials to ACR           │  │
   │  └─────────────────────────────────────────────────────────────────────────  │
   │                                                                              │
-  │  ┌───────────────────────────────┐  ┌──────────────────────────────────┐    │
-  │  │  Storage Initializer          │  │  Triton Server                   │    │
-  │  │  (init container, runs first) │  │  (main container)                │    │
-  │  │                               │  │                                  │    │
-  │  │  env: AZURE_STORAGE_ACCESS_   │  │  Reads model files               │    │
-  │  │  KEY injected from secret     │  │  from /mnt/models/ (Pattern 1)   │    │
+  │  ┌───────────────────────────────┐  ┌──────────────────────────────────┐     │
+  │  │  Storage Initializer          │  │  Triton Server                   │     │
+  │  │  (init container, runs first) │  │  (main container)                │     │
+  │  │                               │  │                                  │     │
+  │  │  env: AZURE_STORAGE_ACCESS_   │  │  Reads model files               │     │
+  │  │  KEY injected from secret     │  │  from /mnt/models/ (Pattern 1)   │     │
   │  │  by KServe controller         │  │  or from image layers (Pattern 2) │    │
-  │  │  (Pattern 1 only)             │  │                                  │    │
-  │  │  → downloads model            │  │  serviceAccount: default         │    │
-  │  │  → writes to /mnt/models/     │  │  (no Azure access needed)        │    │
-  │  └───────────────────────────────┘  └──────────────────────────────────┘    │
+  │  │  (Pattern 1 only)             │  │                                  │     │
+  │  │  → downloads model            │  │  serviceAccount: default         │     │
+  │  │  → writes to /mnt/models/     │  │  (no Azure access needed)        │     │
+  │  └───────────────────────────────┘  └──────────────────────────────────┘     │
   └──────────────────────────────────────────────────────────────────────────────┘
 
   Pattern 1 (model from Blob):   storage secret ──► KServe controller ──► env var ──► storage initializer ──► /mnt/models/
