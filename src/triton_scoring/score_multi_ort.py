@@ -383,7 +383,7 @@ def _dispatch(model_name: str, payload: dict, req_id: str = "") -> "AMLResponse"
             "req_id": req_id, "model": model_name,
             "status": 500, "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
         }))
-        return _err(str(exc), status=500)
+        return _err("Internal server error", status=500)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -452,7 +452,8 @@ def run(request: "AMLRequest") -> "AMLResponse":
                 _save_state()   # propagate change to all other workers
             return _ok({"model": mn, "state": "READY"})
         except Exception as exc:
-            return _err(str(exc), 500)
+            logger.error(f"[{mn}] Model load error: {exc}", exc_info=True)
+            return _err("Internal server error", 500)
 
     # ── Model control: unload ────────────────────────────────────────────
     m = _V2_UNLOAD_RE.search(path)
@@ -475,8 +476,8 @@ def run(request: "AMLRequest") -> "AMLResponse":
             request.data.decode() if isinstance(request.data, bytes) else request.data
         )
         payload = json.loads(raw) if raw else {}
-    except Exception as exc:
-        return _err(f"Could not parse JSON body: {exc}", 400)
+    except Exception:
+        return _err("Could not parse JSON body", 400)
 
     # Priority 1: Triton-style path  /v2/models/{model_name}/infer
     m = _V2_INFER_RE.search(path)
