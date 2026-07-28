@@ -179,9 +179,10 @@ def run(request: "AMLRequest") -> "AMLResponse":
                       else request.data)
             )
             payload = json.loads(raw) if raw else {}
-        except Exception as exc:
+        except Exception:
             status = 400
-            return _err(f"Could not parse JSON body: {exc}", status)
+            logger.warning(f"[run] req_id={req_id} Invalid JSON body", exc_info=True)
+            return _err("Could not parse JSON body", status)
 
         # ── Locate and validate input tensor ─────────────────────────────────
         inp = next(
@@ -194,9 +195,10 @@ def run(request: "AMLRequest") -> "AMLResponse":
 
         try:
             X = _parse_v2_tensor(inp, "float_input", _N_FEATURES)
-        except ValueError as exc:
+        except ValueError:
             status = 400
-            return _err(str(exc), status)
+            logger.warning(f"[run] req_id={req_id} Invalid input tensor", exc_info=True)
+            return _err("Invalid input tensor", status)
 
         # ── Inference ─────────────────────────────────────────────────────────
         labels = _model.predict(X).astype(np.int64).tolist()
@@ -217,7 +219,7 @@ def run(request: "AMLRequest") -> "AMLResponse":
     except Exception as exc:
         status = 500
         logger.error(f"[run] req_id={req_id} Unhandled error: {exc}", exc_info=True)
-        return _err(str(exc), status)
+        return _err("An internal error occurred", status)
 
     finally:
         # Structured log line — queryable in Azure Monitor / Log Analytics
